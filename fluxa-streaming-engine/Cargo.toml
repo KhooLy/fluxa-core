@@ -1,0 +1,48 @@
+[package]
+name = "fluxa_streaming_engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "fluxa_play"
+path = "src/bin/fluxa_play.rs"
+
+[[bin]]
+name = "torrent_bench"
+path = "src/bin/torrent_bench.rs"
+
+[[bin]]
+name = "torrent_serve"
+path = "src/bin/torrent_serve.rs"
+
+[features]
+default = ["native"]
+native = [
+    "dep:axum",
+    "dep:jni",
+    "dep:librqbit",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tokio-util",
+]
+
+[dependencies]
+axum = { version = "0.8", optional = true }
+dolby_vision = { git = "https://github.com/quietvoid/dovi_tool.git", package = "dolby_vision", default-features = false }
+jni = { version = "0.21", optional = true }
+librqbit = { version = "8.1.1", default-features = false, features = ["rust-tls", "disable-upload"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync"], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
