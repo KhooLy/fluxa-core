@@ -1,0 +1,847 @@
+use crate::content_identity::{imdb_id, normalized_billboard_title};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+
+const CORE_SHELF_KEYS: &[&str] = &[
+    "action",
+    "adventure",
+    "aksiyon",
+    "macera",
+    "sci fi",
+    "science fiction",
+    "bilim kurgu",
+    "fantasy",
+    "fantastik",
+    "thriller",
+    "gerilim",
+    "crime",
+    "suc",
+    "comedy",
+    "komedi",
+    "drama",
+    "dram",
+    "family",
+    "aile",
+    "kids",
+    "cocuk",
+    "anime",
+    "mini series",
+    "mini dizi",
+];
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeHomeCategory {
+    name: String,
+    items: Vec<Value>,
+    id: String,
+    #[serde(rename = "type")]
+    content_type: String,
+    semantic_name: Option<String>,
+    movie_genre: Option<String>,
+    series_genre: Option<String>,
+    skip: Option<i32>,
+    can_load_more: Option<bool>,
+    catalog_id: Option<String>,
+    addon_transport_url: Option<String>,
+    addon_genre: Option<String>,
+    catalog_sources: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HomeOptimizeRequest {
+    categories: Vec<NativeHomeCategory>,
+    preferred_order_labels: Vec<String>,
+    preferred_genres: HashMap<String, i32>,
+    preferred_types: HashMap<String, i32>,
+    priority_labels: HomePriorityLabels,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HomePriorityLabels {
+    trending_now: String,
+    popular_for_you: String,
+    most_watched: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorialPickSpec {
+    title: String,
+    min_year: i32,
+}
+
+fn meta_text<'a>(meta: &'a Value, key: &str) -> &'a str {
+    meta.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn meta_i64(meta: &Value, key: &str) -> Option<i64> {
+    meta.get(key).and_then(Value::as_i64)
+}
+
+fn meta_string_array(meta: &Value, key: &str) -> Vec<String> {
+    meta.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn category_semantic_name(category: &NativeHomeCategory) -> &str {
+    category
+        .semantic_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&category.name)
+}
+
+pub(crate) fn normalize_home_key(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut last_space = false;
+    for ch in value.to_lowercase().chars() {
+        let normalized = match ch {
+            'ç' => 'c',
+            'ğ' => 'g',
+            'ı' => 'i',
+            'ö' => 'o',
+            'ş' => 's',
+            'ü' => 'u',
+            ch if ch.is_ascii_alphanumeric() => ch,
+            _ => ' ',
+        };
+        if normalized == ' ' {
+            if !last_space {
+                output.push(' ');
+                last_space = true;
+            }
+        } else {
+            output.push(normalized);
+            last_space = false;
+        }
+    }
+    output.trim().to_string()
+}
+
+fn semantic_score(category: &NativeHomeCategory, item: &Value) -> i32 {
+    let category_keys = [
+        Some(category.name.as_str()),
+        Some(category_semantic_name(category)),
+        category.addon_genre.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(normalize_home_key)
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>();
+    let genre_score = meta_string_array(item, "genres")
+        .into_iter()
+        .map(|genre| normalize_home_key(&genre))
+        .filter(|genre| {
+            category_keys
+                .iter()
+                .any(|key| key == genre || key.contains(genre) || genre.contains(key))
+        })
+        .count() as i32
+        * 4;
+    let title_score = [meta_text(item, "name"), meta_text(item, "originalName")]
+        .into_iter()
+        .map(normalize_home_key)
+        .filter(|title| {
+            category_keys
+                .iter()
+                .any(|key| !key.is_empty() && title.contains(key))
+        })
+        .count() as i32
+        * 2;
+    genre_score + title_score
+}
+
+fn curated_items(category: &NativeHomeCategory) -> Vec<Value> {
+    let mut values = category
+        .items
+        .iter()
+        .map(|item| (item.clone(), semantic_score(category, item)))
+        .collect::<Vec<_>>();
+    values.sort_by(|(left, left_score), (right, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| {
+                meta_i64(left, "rank")
+                    .unwrap_or(i64::MAX)
+                    .cmp(&meta_i64(right, "rank").unwrap_or(i64::MAX))
+            })
+            .then_with(|| {
+                meta_text(right, "imdbRating")
+                    .parse::<f32>()
+                    .unwrap_or(0.0)
+                    .partial_cmp(&meta_text(left, "imdbRating").parse::<f32>().unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter_map(|(item, _)| {
+            let id = meta_text(&item, "id").to_string();
+            if seen.insert(id) {
+                Some(item)
+            } else {
+                None
+            }
+        })
+        .take(24)
+        .collect()
+}
+
+pub(crate) fn curate_home_items_json(category_json: &str) -> Option<String> {
+    let category = serde_json::from_str::<NativeHomeCategory>(category_json).ok()?;
+    serde_json::to_string(&curated_items(&category)).ok()
+}
+
+fn is_pinned(category: &NativeHomeCategory) -> bool {
+    category.id == "library"
+        || category.id == "watchlist"
+        || category.id == "continue_watching"
+        || category.content_type == "collection"
+        || category.content_type == "collection_folder"
+}
+
+fn priority_boost(category: &NativeHomeCategory, labels: &HomePriorityLabels) -> i32 {
+    let key = normalize_home_key(category_semantic_name(category));
+    if key.contains(&normalize_home_key(&labels.trending_now)) {
+        40
+    } else if key.contains(&normalize_home_key(&labels.popular_for_you)) {
+        32
+    } else if key.contains(&normalize_home_key(&labels.most_watched)) {
+        28
+    } else if key.contains("new") || key.contains("yeni") {
+        16
+    } else {
+        0
+    }
+}
+
+fn personalization_score(
+    category: &NativeHomeCategory,
+    preferred_genres: &HashMap<String, i32>,
+    preferred_types: &HashMap<String, i32>,
+    labels: &HomePriorityLabels,
+) -> i32 {
+    let type_affinity = category
+        .items
+        .iter()
+        .map(|item| {
+            preferred_types
+                .get(meta_text(item, "type"))
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<i32>()
+        * 12;
+    let genre_affinity = category
+        .items
+        .iter()
+        .flat_map(|item| meta_string_array(item, "genres"))
+        .map(|genre| {
+            preferred_genres
+                .get(&normalize_home_key(&genre))
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<i32>()
+        * 10;
+    let unique_top_items = category
+        .items
+        .iter()
+        .take(10)
+        .map(|item| meta_text(item, "id").to_string())
+        .collect::<HashSet<_>>()
+        .len() as i32
+        * 8;
+    let reason_boost = category
+        .items
+        .iter()
+        .filter(|item| !meta_text(item, "reason").is_empty())
+        .count() as i32
+        * 14;
+    type_affinity
+        + genre_affinity
+        + unique_top_items
+        + reason_boost
+        + priority_boost(category, labels)
+}
+
+fn overlap_ratio(first: &NativeHomeCategory, second: &NativeHomeCategory) -> f32 {
+    let first_ids = first
+        .items
+        .iter()
+        .take(12)
+        .map(|item| meta_text(item, "id").to_string())
+        .collect::<HashSet<_>>();
+    let second_ids = second
+        .items
+        .iter()
+        .take(12)
+        .map(|item| meta_text(item, "id").to_string())
+        .collect::<HashSet<_>>();
+    if first_ids.is_empty() || second_ids.is_empty() {
+        return 0.0;
+    }
+    first_ids.intersection(&second_ids).count() as f32
+        / first_ids.len().min(second_ids.len()) as f32
+}
+
+pub(crate) fn home_overlap_ratio_json(first_json: &str, second_json: &str) -> Option<f32> {
+    let first = serde_json::from_str::<NativeHomeCategory>(first_json).ok()?;
+    let second = serde_json::from_str::<NativeHomeCategory>(second_json).ok()?;
+    Some(overlap_ratio(&first, &second))
+}
+
+fn is_core_genre_shelf(category: &NativeHomeCategory) -> bool {
+    if category.movie_genre.is_some()
+        || category.series_genre.is_some()
+        || category.addon_genre.is_some()
+    {
+        return true;
+    }
+    let key = normalize_home_key(category_semantic_name(category));
+    CORE_SHELF_KEYS
+        .iter()
+        .any(|candidate| key == *candidate || key.contains(candidate))
+}
+
+fn cluster_key(category: &NativeHomeCategory) -> Option<String> {
+    if let Some(genre) = category.movie_genre.as_deref() {
+        return Some(format!("movie:{}", normalize_home_key(genre)));
+    }
+    if let Some(genre) = category.series_genre.as_deref() {
+        return Some(format!("series:{}", normalize_home_key(genre)));
+    }
+    if let Some(genre) = category.addon_genre.as_deref() {
+        return Some(format!("addon:{}", normalize_home_key(genre)));
+    }
+    let key = normalize_home_key(category_semantic_name(category));
+    CORE_SHELF_KEYS
+        .iter()
+        .find(|candidate| key == **candidate || key.contains(*candidate))
+        .map(|value| (*value).to_string())
+}
+
+fn cluster_overlap_ratio(first: &NativeHomeCategory, second: &NativeHomeCategory) -> f32 {
+    let Some(first_cluster) = cluster_key(first) else {
+        return 0.0;
+    };
+    let Some(second_cluster) = cluster_key(second) else {
+        return 0.0;
+    };
+    if first_cluster == second_cluster {
+        overlap_ratio(first, second)
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn home_personalization_score_json(
+    category_json: &str,
+    preferred_genres_json: &str,
+    preferred_types_json: &str,
+    priority_labels_json: &str,
+) -> Option<i32> {
+    let category = serde_json::from_str::<NativeHomeCategory>(category_json).ok()?;
+    let preferred_genres =
+        serde_json::from_str::<HashMap<String, i32>>(preferred_genres_json).ok()?;
+    let preferred_types =
+        serde_json::from_str::<HashMap<String, i32>>(preferred_types_json).ok()?;
+    let labels = serde_json::from_str::<HomePriorityLabels>(priority_labels_json).ok()?;
+    Some(personalization_score(
+        &category,
+        &preferred_genres,
+        &preferred_types,
+        &labels,
+    ))
+}
+
+pub(crate) fn home_prioritize_rows_json(
+    categories_json: &str,
+    preferred_order_labels_json: &str,
+    preferred_genres_json: &str,
+    preferred_types_json: &str,
+    priority_labels_json: &str,
+) -> Option<String> {
+    let mut categories = serde_json::from_str::<Vec<NativeHomeCategory>>(categories_json).ok()?;
+    let preferred_order_labels =
+        serde_json::from_str::<Vec<String>>(preferred_order_labels_json).ok()?;
+    let preferred_genres =
+        serde_json::from_str::<HashMap<String, i32>>(preferred_genres_json).ok()?;
+    let preferred_types =
+        serde_json::from_str::<HashMap<String, i32>>(preferred_types_json).ok()?;
+    let labels = serde_json::from_str::<HomePriorityLabels>(priority_labels_json).ok()?;
+    let preferred_order = preferred_order_labels
+        .iter()
+        .map(|value| normalize_home_key(value))
+        .collect::<Vec<_>>();
+    categories.sort_by(|left, right| {
+        let left_index = preferred_order
+            .iter()
+            .position(|key| key == &normalize_home_key(category_semantic_name(left)))
+            .unwrap_or(usize::MAX);
+        let right_index = preferred_order
+            .iter()
+            .position(|key| key == &normalize_home_key(category_semantic_name(right)))
+            .unwrap_or(usize::MAX);
+        left_index.cmp(&right_index).then_with(|| {
+            personalization_score(right, &preferred_genres, &preferred_types, &labels).cmp(
+                &personalization_score(left, &preferred_genres, &preferred_types, &labels),
+            )
+        })
+    });
+    serde_json::to_string(&categories).ok()
+}
+
+pub(crate) fn optimize_home_rows_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<HomeOptimizeRequest>(request_json).ok()?;
+    if request.categories.is_empty() {
+        return Some("[]".to_string());
+    }
+    let pinned = distinct_categories(
+        request
+            .categories
+            .iter()
+            .filter(|category| is_pinned(category))
+            .cloned(),
+    );
+    let mut candidates = distinct_categories(
+        request
+            .categories
+            .into_iter()
+            .filter(|category| !is_pinned(category)),
+    )
+    .into_iter()
+    .map(|mut category| {
+        category.items = curated_items(&category);
+        category
+    })
+    .filter(|category| category.items.len() >= 4)
+    .collect::<Vec<_>>();
+    let preferred_order = request
+        .preferred_order_labels
+        .iter()
+        .map(|value| normalize_home_key(value))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left_index = preferred_order
+            .iter()
+            .position(|key| key == &normalize_home_key(category_semantic_name(left)))
+            .unwrap_or(usize::MAX);
+        let right_index = preferred_order
+            .iter()
+            .position(|key| key == &normalize_home_key(category_semantic_name(right)))
+            .unwrap_or(usize::MAX);
+        left_index.cmp(&right_index).then_with(|| {
+            personalization_score(
+                right,
+                &request.preferred_genres,
+                &request.preferred_types,
+                &request.priority_labels,
+            )
+            .cmp(&personalization_score(
+                left,
+                &request.preferred_genres,
+                &request.preferred_types,
+                &request.priority_labels,
+            ))
+        })
+    });
+
+    let mut kept = Vec::<NativeHomeCategory>::new();
+    for category in candidates.iter() {
+        let overlap = kept
+            .iter()
+            .map(|existing| overlap_ratio(existing, category))
+            .fold(0.0, f32::max);
+        let cluster_overlap = kept
+            .iter()
+            .map(|existing| cluster_overlap_ratio(existing, category))
+            .fold(0.0, f32::max);
+        let min_unique = category
+            .items
+            .iter()
+            .take(12)
+            .map(|item| meta_text(item, "id").to_string())
+            .collect::<HashSet<_>>()
+            .len();
+        if min_unique < 5 {
+            continue;
+        }
+        if is_core_genre_shelf(category)
+            || (overlap < 0.68 && cluster_overlap < 0.52)
+            || kept.len() < 8
+        {
+            kept.push(category.clone());
+        }
+    }
+
+    let fallback = candidates
+        .into_iter()
+        .filter(|candidate| {
+            kept.iter().all(|existing| existing.id != candidate.id)
+                && kept.iter().all(|existing| {
+                    overlap_ratio(existing, candidate) < 0.68
+                        && cluster_overlap_ratio(existing, candidate) < 0.52
+                })
+        })
+        .take(24usize.saturating_sub(kept.len()))
+        .collect::<Vec<_>>();
+    let mut output = pinned;
+    output.extend(kept);
+    output.extend(fallback);
+    let limit = 24 + output_pinned_count(&output);
+    let output = distinct_categories(output.into_iter())
+        .into_iter()
+        .take(limit)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&output).ok()
+}
+
+fn output_pinned_count(categories: &[NativeHomeCategory]) -> usize {
+    categories
+        .iter()
+        .filter(|category| is_pinned(category))
+        .count()
+}
+
+fn distinct_categories<I>(categories: I) -> Vec<NativeHomeCategory>
+where
+    I: IntoIterator<Item = NativeHomeCategory>,
+{
+    let mut seen = HashSet::new();
+    categories
+        .into_iter()
+        .filter(|category| seen.insert(category.id.clone()))
+        .collect()
+}
+
+pub(crate) fn has_billboard_backdrop_candidate_json(meta_json: &str) -> bool {
+    serde_json::from_str::<Value>(meta_json)
+        .ok()
+        .is_some_and(|meta| has_backdrop_candidate(&meta))
+}
+
+fn has_backdrop_candidate(meta: &Value) -> bool {
+    let background = meta_text(meta, "background");
+    !background.is_empty() && !background.eq_ignore_ascii_case(meta_text(meta, "poster"))
+}
+
+pub(crate) fn billboard_score_candidate_json(
+    meta_json: &str,
+    days_since_release: Option<i64>,
+) -> Option<i32> {
+    let meta = serde_json::from_str::<Value>(meta_json).ok()?;
+    Some(score_candidate(&meta, days_since_release))
+}
+
+fn score_candidate(meta: &Value, days_since_release: Option<i64>) -> i32 {
+    let release_boost = match days_since_release {
+        None => 0,
+        Some(days) if days < 0 => 40,
+        Some(days) if days <= 14 => 440,
+        Some(days) if days <= 45 => 280,
+        Some(days) if days <= 120 => 120,
+        Some(_) => 0,
+    };
+    let type_boost = if meta_text(meta, "type") == "series" {
+        320
+    } else {
+        140
+    };
+    let rank_boost = meta_i64(meta, "rank")
+        .map(|rank| (220 - ((rank as i32 - 1) * 18)).max(0))
+        .unwrap_or(0);
+    let rating_boost = (meta_text(meta, "imdbRating").parse::<f32>().unwrap_or(0.0) * 22.0) as i32;
+    let recommendation_boost = if meta_text(meta, "reason").is_empty() {
+        0
+    } else {
+        180
+    };
+    let editorial_boost = if meta_text(meta, "reason") == "EDITORIAL_SPOTLIGHT" {
+        520
+    } else {
+        0
+    };
+    let backdrop_boost = if has_backdrop_candidate(meta) {
+        260
+    } else if !meta_text(meta, "poster").is_empty() {
+        40
+    } else {
+        -240
+    };
+    type_boost
+        + release_boost
+        + rank_boost
+        + rating_boost
+        + recommendation_boost
+        + editorial_boost
+        + backdrop_boost
+}
+
+pub(crate) fn billboard_visual_score_json(meta_json: &str) -> Option<i32> {
+    let meta = serde_json::from_str::<Value>(meta_json).ok()?;
+    let mut score = 0;
+    if has_backdrop_candidate(&meta) {
+        score += 320;
+    } else {
+        score -= 160;
+    }
+    if !meta_text(&meta, "logo").is_empty() {
+        score += 120;
+    }
+    if !meta_text(&meta, "description").is_empty() {
+        score += 30;
+    }
+    Some(score)
+}
+
+pub(crate) fn billboard_editorial_match_score_json(
+    meta_json: &str,
+    spec_json: &str,
+) -> Option<i32> {
+    let meta = serde_json::from_str::<Value>(meta_json).ok()?;
+    let spec = serde_json::from_str::<EditorialPickSpec>(spec_json).ok()?;
+    let _ = spec.title;
+    let release_year = meta_text(&meta, "releaseInfo").parse::<i32>().unwrap_or(0);
+    let year_boost = if release_year >= spec.min_year {
+        400
+    } else {
+        0
+    };
+    let rating_boost = (meta_text(&meta, "imdbRating").parse::<f32>().unwrap_or(0.0) * 20.0) as i32;
+    let rank_boost = meta_i64(&meta, "rank")
+        .map(|rank| (180 - (rank as i32 * 12)).max(0))
+        .unwrap_or(0);
+    Some(year_boost + rating_boost + rank_boost)
+}
+
+// ── Billboard pool selection ──────────────────────────────────────────────────
+
+fn billboard_key_value(meta: &Value) -> String {
+    let id = meta_text(meta, "id");
+    if let Some(iid) = imdb_id(id) {
+        return format!("{}:{iid}", meta_text(meta, "type"));
+    }
+    let name = meta
+        .get("originalName")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| meta_text(meta, "name"));
+    let year = meta_text(meta, "releaseInfo")
+        .get(0..4)
+        .or_else(|| meta_text(meta, "released").get(0..4))
+        .unwrap_or("");
+    format!(
+        "{}:{}:{year}",
+        meta_text(meta, "type"),
+        normalized_billboard_title(name)
+    )
+}
+
+fn title_key_value(meta: &Value) -> String {
+    let name = meta
+        .get("originalName")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| meta_text(meta, "name"));
+    normalized_billboard_title(name)
+}
+
+fn distinct_by_billboard_key(items: Vec<Value>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|m| seen.insert(billboard_key_value(m)))
+        .collect()
+}
+
+fn distinct_by_title_key(items: Vec<Value>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|m| seen.insert(title_key_value(m)))
+        .collect()
+}
+
+fn billboard_visual_score(meta: &Value) -> i32 {
+    let mut score = 0i32;
+    if has_backdrop_candidate(meta) {
+        score += 320;
+    } else {
+        score -= 160;
+    }
+    if !meta_text(meta, "logo").is_empty() {
+        score += 120;
+    }
+    if !meta_text(meta, "description").is_empty() {
+        score += 30;
+    }
+    score
+}
+
+/// Selects a billboard pool of up to 10 items from the enriched+raw candidate sets.
+///
+/// `enriched_json` — candidates that have been enriched via IO (backdrop, logo, etc.).
+/// `candidates_json` — the full original candidate list (before enrichment).
+///
+/// Decision logic (what runs here, not on the Kotlin side):
+///   • editorial picks  — up to 3 items with reason == "EDITORIAL_SPOTLIGHT"
+///   • series picks     — up to 8 items of type "series"
+///   • movie picks      — up to 3 items of type "movie"
+///   • combined, deduplicated, filled to 10 from remaining ranked items
+pub(crate) fn build_billboard_pool_json(
+    enriched_json: &str,
+    candidates_json: &str,
+) -> Option<String> {
+    let enriched: Vec<Value> = serde_json::from_str(enriched_json).ok()?;
+    let candidates: Vec<Value> = serde_json::from_str(candidates_json).ok()?;
+
+    let enriched_by_key: HashMap<String, Value> = enriched
+        .iter()
+        .map(|m| (billboard_key_value(m), m.clone()))
+        .collect();
+
+    // Editorial picks: prefer the enriched version, fall back to original when it has artwork.
+    let editorial_raw: Vec<Value> = candidates
+        .iter()
+        .filter(|m| meta_text(m, "reason") == "EDITORIAL_SPOTLIGHT")
+        .filter_map(|m| {
+            let key = billboard_key_value(m);
+            enriched_by_key.get(&key).cloned().or_else(|| {
+                if has_backdrop_candidate(m) || !meta_text(m, "poster").is_empty() {
+                    Some(m.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    let mut editorial = editorial_raw;
+    editorial.sort_by(|a, b| score_candidate(b, None).cmp(&score_candidate(a, None)));
+    let editorial: Vec<Value> = distinct_by_title_key(editorial)
+        .into_iter()
+        .take(3)
+        .collect();
+
+    // Ranked pool: merge enriched + candidates, deduplicate, filter, sort by score+visual.
+    let combined: Vec<Value> = enriched.into_iter().chain(candidates).collect();
+    let combined = distinct_by_title_key(distinct_by_billboard_key(combined));
+    let mut ranked: Vec<Value> = combined
+        .into_iter()
+        .filter(|m| has_backdrop_candidate(m) || !meta_text(m, "poster").is_empty())
+        .collect();
+    ranked.sort_by(|a, b| {
+        let sb = score_candidate(b, None) + billboard_visual_score(b);
+        let sa = score_candidate(a, None) + billboard_visual_score(a);
+        sb.cmp(&sa)
+    });
+
+    let series: Vec<Value> = ranked
+        .iter()
+        .filter(|m| meta_text(m, "type") == "series")
+        .take(8)
+        .cloned()
+        .collect();
+    let movies: Vec<Value> = ranked
+        .iter()
+        .filter(|m| meta_text(m, "type") == "movie")
+        .take(3)
+        .cloned()
+        .collect();
+
+    let preferred: Vec<Value> = distinct_by_title_key(distinct_by_billboard_key(
+        editorial.into_iter().chain(series).chain(movies).collect(),
+    ));
+
+    let final_pool: Vec<Value> = if preferred.len() >= 10 {
+        preferred.into_iter().take(10).collect()
+    } else {
+        let preferred_keys: HashSet<String> =
+            preferred.iter().map(billboard_key_value).collect();
+        let preferred_titles: HashSet<String> =
+            preferred.iter().map(title_key_value).collect();
+        let extras = ranked.into_iter().filter(|m| {
+            !preferred_keys.contains(&billboard_key_value(m))
+                && !preferred_titles.contains(&title_key_value(m))
+        });
+        preferred.into_iter().chain(extras).take(10).collect()
+    };
+
+    serde_json::to_string(&final_pool).ok()
+}
+
+// ── Catalog item normalisation ────────────────────────────────────────────────
+
+fn iso_date_part(date_str: &str) -> Option<&str> {
+    let s = date_str.trim();
+    if s.len() < 10 {
+        return None;
+    }
+    let date_part = &s[..10];
+    let b = date_part.as_bytes();
+    if b[4] == b'-' && b[7] == b'-' {
+        Some(date_part)
+    } else {
+        None
+    }
+}
+
+fn is_upcoming_date(date_str: &str, today_iso: &str) -> bool {
+    iso_date_part(date_str).is_some_and(|d| d > today_iso)
+}
+
+const RANKED_CATALOG_IDS: &[&str] = &["trending", "popular", "top", "now_playing"];
+
+/// Normalises catalog items on behalf of the Kotlin HomeCatalogItemNormalizer.
+///
+/// Decisions kept here (Rust decides, Kotlin executes):
+///   • Assign `rank = index + 1` for ranking catalogs when no genre filter is active.
+///   • Drop items whose release date is still in the future (upcoming releases).
+///
+/// `genre` being `None` / empty string means no genre filter is active.
+/// `today_iso` must be supplied as "YYYY-MM-DD" by the caller.
+pub(crate) fn normalize_home_catalog_items_json(
+    items_json: &str,
+    catalog_id: &str,
+    genre: Option<&str>,
+    today_iso: &str,
+) -> Option<String> {
+    let items: Vec<Value> = serde_json::from_str(items_json).ok()?;
+    let assign_rank = genre.map(|g| g.is_empty()).unwrap_or(true)
+        && RANKED_CATALOG_IDS.contains(&catalog_id);
+
+    let mut rank: i64 = 0;
+    let result: Vec<Value> = items
+        .into_iter()
+        .filter_map(|mut item| {
+            let released = item.get("released").and_then(Value::as_str).unwrap_or("");
+            if is_upcoming_date(released, today_iso) {
+                return None;
+            }
+            if assign_rank {
+                rank += 1;
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("rank".to_string(), json!(rank));
+                }
+            }
+            Some(item)
+        })
+        .collect();
+
+    serde_json::to_string(&result).ok()
+}

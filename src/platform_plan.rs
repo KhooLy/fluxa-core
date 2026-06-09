@@ -1,0 +1,654 @@
+use crate::addon_protocol::{build_resource_url, supports_resource};
+use crate::content_identity::parse_extra_args_json;
+use crate::repository_flow::addon_streams_with_provider_json;
+use crate::stream_policy::stream_playback_info_json;
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceFetchPlanRequest {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    addons: Vec<Value>,
+    #[serde(default)]
+    transport_url: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    catalog_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    request_ids: Vec<String>,
+    #[serde(default)]
+    extra: Map<String, Value>,
+    #[serde(default)]
+    extra_raw: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    genre: Option<String>,
+    #[serde(default)]
+    skip: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceParseRequest {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    response: Value,
+    #[serde(default)]
+    addon_name: Option<String>,
+    #[serde(default)]
+    season: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaybackPrepareRequest {
+    stream: Value,
+    #[serde(default)]
+    meta: Option<Value>,
+    #[serde(default)]
+    episode: Option<Value>,
+    #[serde(default)]
+    preferred_player: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryLocalStateRequest {
+    #[serde(default)]
+    library: Value,
+    #[serde(default)]
+    primary_id: Option<String>,
+    #[serde(default)]
+    fallback_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreferenceUpdateRequest {
+    #[serde(default)]
+    existing: Map<String, Value>,
+    key: String,
+    value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddonCollectionMutationRequest {
+    #[serde(default)]
+    existing: Vec<Value>,
+    #[serde(default)]
+    incoming: Vec<Value>,
+    #[serde(default)]
+    remove_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailEpisodePlanRequest {
+    #[serde(default)]
+    episodes: Vec<Value>,
+    #[serde(default)]
+    selected_season: Option<i64>,
+    #[serde(default)]
+    selected_episode_id: Option<String>,
+    #[serde(default)]
+    meta_id: Option<String>,
+}
+
+pub(crate) fn resource_fetch_plan_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<ResourceFetchPlanRequest>(request_json).ok()?;
+    let mut requests = Vec::<Value>::new();
+
+    match request.kind.as_str() {
+        "catalogPage" => {
+            let transport_url = request.transport_url.as_deref()?;
+            let content_type = request.content_type.as_deref()?;
+            let catalog_id = request.catalog_id.as_deref()?;
+            requests.push(json!({
+                "url": build_resource_url(transport_url, "catalog", content_type, catalog_id, extra_json(&request).as_deref()),
+                "kind": "catalogPage"
+            }));
+        }
+        "search" => {
+            let query = request.query.as_deref().unwrap_or("");
+            for addon in &request.addons {
+                let Some(transport_url) = addon_transport_url(addon) else { continue };
+                for catalog in addon_catalogs(addon) {
+                    if !catalog_supports_search(&catalog) {
+                        continue;
+                    }
+                    let Some(content_type) = catalog.get("type").and_then(Value::as_str) else { continue };
+                    let Some(id) = catalog.get("id").and_then(Value::as_str) else { continue };
+                    requests.push(json!({
+                        "url": build_resource_url(transport_url, "catalog", content_type, id, Some(&json!({"search": query}).to_string())),
+                        "kind": "search",
+                        "addonName": addon_display_name(addon),
+                        "catalogId": id,
+                        "catalogType": content_type,
+                        "categoryId": format!("{}:{}:{}", transport_url, content_type, id),
+                        "categoryName": search_category_name(addon, &catalog, content_type)
+                    }));
+                }
+            }
+        }
+        "discover" => {
+            let genre = request.genre.as_deref();
+            for catalog in discover_catalog_options(&request.addons, request.content_type.as_deref().unwrap_or("")) {
+                let extra = genre.map(|value| json!({"genre": value}).to_string());
+                    requests.push(json!({
+                        "url": build_resource_url(
+                            &catalog.transport_url,
+                            "catalog",
+                            &catalog.content_type,
+                            &catalog.id,
+                            extra.as_deref()
+                        ),
+                    "kind": "discover",
+                    "catalogKey": catalog.key
+                }));
+            }
+        }
+        "metaDetail" => {
+            let content_type = request.content_type.as_deref()?;
+            let id = request.id.as_deref()?;
+            for addon in &request.addons {
+                if !addon_supports(addon, "meta", content_type, Some(id)) {
+                    continue;
+                }
+                let Some(transport_url) = addon_transport_url(addon) else { continue };
+                requests.push(json!({
+                    "url": build_resource_url(transport_url, "meta", content_type, id, None),
+                    "kind": "metaDetail",
+                    "addonName": addon_display_name(addon),
+                    "stopOnFirstResult": true
+                }));
+            }
+        }
+        "streams" => {
+            let content_type = request.content_type.as_deref()?;
+            for addon in &request.addons {
+                if !addon_supports(addon, "stream", content_type, None) {
+                    continue;
+                }
+                let Some(transport_url) = addon_transport_url(addon) else { continue };
+                for id in &request.request_ids {
+                    requests.push(json!({
+                        "url": build_resource_url(transport_url, "stream", content_type, id, None),
+                        "kind": "streams",
+                        "addonName": addon_display_name(addon)
+                    }));
+                }
+            }
+        }
+        "seasonEpisodes" => {
+            let series_id = request.id.as_deref()?;
+            for addon in &request.addons {
+                if !addon_supports(addon, "meta", "series", Some(series_id)) {
+                    continue;
+                }
+                let Some(transport_url) = addon_transport_url(addon) else { continue };
+                requests.push(json!({
+                    "url": build_resource_url(transport_url, "meta", "series", series_id, None),
+                    "kind": "seasonEpisodes",
+                    "addonName": addon_display_name(addon),
+                    "stopOnFirstResult": true
+                }));
+            }
+        }
+        "subtitles" => {
+            let content_type = request.content_type.as_deref()?;
+            let id = request.id.as_deref()?;
+            for addon in &request.addons {
+                if !addon_supports(addon, "subtitles", content_type, Some(id)) {
+                    continue;
+                }
+                let Some(transport_url) = addon_transport_url(addon) else { continue };
+                requests.push(json!({
+                    "url": build_resource_url(transport_url, "subtitles", content_type, id, None),
+                    "kind": "subtitles",
+                    "addonName": addon_display_name(addon)
+                }));
+                if !request.extra_raw.trim().is_empty() {
+                    requests.push(json!({
+                        "url": build_resource_url(
+                            transport_url,
+                            "subtitles",
+                            content_type,
+                            id,
+                            parse_extra_args_json(&request.extra_raw).as_deref()
+                        ),
+                        "kind": "subtitles",
+                        "addonName": addon_display_name(addon)
+                    }));
+                }
+            }
+        }
+        _ => {
+            let transport_url = request.transport_url.as_deref()?;
+            let resource = request.resource.as_deref()?;
+            let content_type = request.content_type.as_deref()?;
+            let id = request.id.as_deref()?;
+            requests.push(json!({
+                "url": build_resource_url(transport_url, resource, content_type, id, extra_json(&request).as_deref()),
+                "kind": request.kind
+            }));
+        }
+    }
+
+    serde_json::to_string(&json!({ "requests": requests })).ok()
+}
+
+pub(crate) fn resource_parse_plan_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<ResourceParseRequest>(request_json).ok()?;
+    let response = request.response;
+    let value = match request.kind.as_str() {
+        "catalogPage" | "discover" | "search" => {
+            json!({ "items": response.get("metas").and_then(Value::as_array).cloned().unwrap_or_default() })
+        }
+        "metaDetail" => json!({ "meta": response.get("meta").cloned().unwrap_or(Value::Null) }),
+        "streams" => {
+            let streams = response
+                .get("streams")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let normalized = addon_streams_with_provider_json(
+                &Value::Array(streams).to_string(),
+                request.addon_name.as_deref().unwrap_or(""),
+            );
+            json!({ "streams": serde_json::from_str::<Value>(&normalized).unwrap_or(Value::Array(vec![])) })
+        }
+        "seasonEpisodes" => {
+            let videos = response
+                .get("meta")
+                .and_then(|meta| meta.get("videos"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|video| {
+                    request.season.is_none()
+                        || video.get("season").and_then(Value::as_i64) == request.season
+                })
+                .collect::<Vec<_>>();
+            json!({ "episodes": videos })
+        }
+        "subtitles" => {
+            json!({ "subtitles": response.get("subtitles").and_then(Value::as_array).cloned().unwrap_or_default() })
+        }
+        _ => response,
+    };
+    serde_json::to_string(&value).ok()
+}
+
+pub(crate) fn playback_prepare_plan_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<PlaybackPrepareRequest>(request_json).ok()?;
+    let info = stream_playback_info_json(&request.stream.to_string())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let playable_url = info
+        .get("playableUrl")
+        .or_else(|| request.stream.get("playableUrl"))
+        .or_else(|| request.stream.get("url"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let is_torrent = info
+        .get("isTorrentPlaybackUrl")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || playable_url.starts_with("stremio://torrent/")
+        || request.stream.get("infoHash").and_then(Value::as_str).is_some();
+    let compatible = info
+        .get("isLikelyPlayerCompatible")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mode = if playable_url.is_empty() {
+        "reject"
+    } else if !compatible {
+        "reject"
+    } else if is_torrent {
+        "torrent"
+    } else {
+        "direct"
+    };
+    serde_json::to_string(&json!({
+        "mode": mode,
+        "url": playable_url,
+        "isTorrent": is_torrent,
+        "rejectReason": if playable_url.is_empty() { "missing_playable_url" } else if !compatible { "incompatible_stream" } else { "" },
+        "subtitleExtraArgs": info.get("subtitleExtraArgs").cloned().unwrap_or(Value::Null),
+        "title": playback_title(request.meta.as_ref(), request.episode.as_ref(), &request.stream),
+        "artwork": playback_artwork(request.meta.as_ref(), request.episode.as_ref()),
+        "preferredPlayer": request.preferred_player.unwrap_or_else(|| "mpv".to_string())
+    }))
+    .ok()
+}
+
+pub(crate) fn library_local_state_plan_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<LibraryLocalStateRequest>(request_json).ok()?;
+    let id = request
+        .primary_id
+        .as_deref()
+        .or(request.fallback_id.as_deref())
+        .unwrap_or("");
+    let progress = request
+        .library
+        .get("progress")
+        .and_then(|value| value.get(id))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let is_in_watchlist = request
+        .library
+        .get("watchlist")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+        });
+    let watched_video_ids = request
+        .library
+        .get("watched")
+        .and_then(Value::as_object)
+        .map(|watched| {
+            watched
+                .iter()
+                .filter(|(key, value)| key.starts_with(id) && value.as_bool().unwrap_or(false))
+                .map(|(key, _)| Value::String(key.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&json!({
+        "progress": progress,
+        "isInWatchlist": is_in_watchlist,
+        "watchedVideoIds": watched_video_ids
+    }))
+    .ok()
+}
+
+pub(crate) fn preferences_schema_json() -> String {
+    json!({
+        "keys": [
+            "language",
+            "startPage",
+            "preferredPlayer",
+            "streamSourceSelectionMode",
+            "streamSourceRegexPattern",
+            "preferredAudioLanguage",
+            "secondaryAudioLanguage",
+            "preferredSubtitleLanguage",
+            "secondarySubtitleLanguage",
+            "subtitleSize",
+            "playbackSpeed",
+            "torrentSpeedPreset",
+            "torrentCachePreset",
+            "downloadSourceSelectionMode",
+            "downloadSubtitleLanguage"
+        ]
+    })
+    .to_string()
+}
+
+pub(crate) fn apply_preference_update_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<PreferenceUpdateRequest>(request_json).ok()?;
+    let mut updated = request.existing;
+    let value = normalize_preference_value(&request.key, request.value);
+    updated.insert(request.key, value);
+    serde_json::to_string(&Value::Object(updated)).ok()
+}
+
+pub(crate) fn addon_collection_mutation_plan_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<AddonCollectionMutationRequest>(request_json).ok()?;
+    let mut addons = request.existing;
+    if let Some(remove_key) = request.remove_key.as_deref() {
+        addons.retain(|addon| addon_key(addon) != remove_key);
+    }
+    for incoming in request.incoming {
+        let key = addon_key(&incoming);
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(existing) = addons.iter_mut().find(|addon| addon_key(addon) == key) {
+            *existing = incoming;
+        } else {
+            addons.push(incoming);
+        }
+    }
+    serde_json::to_string(&json!({ "addons": addons })).ok()
+}
+
+pub(crate) fn detail_episode_plan_json(request_json: &str) -> Option<String> {
+    let request = serde_json::from_str::<DetailEpisodePlanRequest>(request_json).ok()?;
+    let mut seasons = request
+        .episodes
+        .iter()
+        .filter_map(|episode| episode.get("season").and_then(Value::as_i64).or(Some(1)))
+        .collect::<Vec<_>>();
+    seasons.sort_unstable();
+    seasons.dedup();
+    // Search for the target episode across ALL episodes before season filtering,
+    // so that a lastVideoId from a later season (e.g. S9 when default would be S1) is found.
+    let target_episode = request
+        .selected_episode_id
+        .as_deref()
+        .and_then(|id| {
+            request
+                .episodes
+                .iter()
+                .find(|ep| ep.get("id").and_then(Value::as_str) == Some(id))
+                .cloned()
+        });
+    let selected_season = target_episode
+        .as_ref()
+        .and_then(|ep| ep.get("season").and_then(Value::as_i64))
+        .or_else(|| request.selected_season.filter(|season| seasons.contains(season)))
+        .or_else(|| seasons.first().copied())
+        .unwrap_or(1);
+    let episodes = request
+        .episodes
+        .into_iter()
+        .filter(|episode| episode.get("season").and_then(Value::as_i64).unwrap_or(1) == selected_season)
+        .collect::<Vec<_>>();
+    let selected_episode = target_episode
+        .filter(|ep| ep.get("season").and_then(Value::as_i64).unwrap_or(1) == selected_season)
+        .or_else(|| episodes.first().cloned());
+    serde_json::to_string(&json!({
+        "seasonNumbers": seasons,
+        "selectedSeason": selected_season,
+        "episodes": episodes,
+        "selectedEpisode": selected_episode,
+        "streamRequestId": selected_episode
+            .as_ref()
+            .and_then(|episode| episode.get("id").and_then(Value::as_str))
+            .or(request.meta_id.as_deref())
+    }))
+    .ok()
+}
+
+fn extra_json(request: &ResourceFetchPlanRequest) -> Option<String> {
+    let mut extra = request.extra.clone();
+    if let Some(genre) = request.genre.as_ref().filter(|value| !value.is_empty()) {
+        extra.insert("genre".to_string(), Value::String(genre.clone()));
+    }
+    if let Some(search) = request.query.as_ref().filter(|value| !value.is_empty()) {
+        extra.insert("search".to_string(), Value::String(search.clone()));
+    }
+    if let Some(skip) = request.skip.filter(|value| *value > 0) {
+        extra.insert("skip".to_string(), Value::Number(skip.into()));
+    }
+    (!extra.is_empty()).then(|| Value::Object(extra).to_string())
+}
+
+fn addon_transport_url(addon: &Value) -> Option<&str> {
+    addon.get("transportUrl").and_then(Value::as_str)
+}
+
+fn addon_manifest(addon: &Value) -> Value {
+    addon.get("manifest").cloned().unwrap_or_else(|| addon.clone())
+}
+
+fn addon_catalogs(addon: &Value) -> Vec<Value> {
+    addon_manifest(addon)
+        .get("catalogs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn addon_supports(addon: &Value, resource: &str, content_type: &str, id: Option<&str>) -> bool {
+    let manifest = addon_manifest(addon);
+    supports_resource(&manifest.to_string(), resource, Some(content_type), id)
+}
+
+fn addon_display_name(addon: &Value) -> String {
+    addon.get("name")
+        .or_else(|| addon.get("manifest").and_then(|manifest| manifest.get("name")))
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown Addon")
+        .to_string()
+}
+
+fn catalog_supports_search(catalog: &Value) -> bool {
+    catalog
+        .get("extra")
+        .and_then(Value::as_array)
+        .is_some_and(|extra| {
+            extra
+                .iter()
+                .any(|item| item.get("name").and_then(Value::as_str) == Some("search"))
+        })
+        || catalog
+            .get("extraSupported")
+            .and_then(Value::as_array)
+            .is_some_and(|extra| extra.iter().any(|item| item.as_str() == Some("search")))
+}
+
+fn search_category_name(addon: &Value, catalog: &Value, content_type: &str) -> String {
+    let addon_name = addon_display_name(addon);
+    let catalog_name = catalog
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(match content_type {
+            "movie" => "Movies",
+            "series" => "Series",
+            other => other,
+        });
+    format!("{addon_name} - {catalog_name}")
+}
+
+struct DiscoverCatalog {
+    key: String,
+    transport_url: String,
+    content_type: String,
+    id: String,
+}
+
+fn discover_catalog_options(addons: &[Value], selected_type: &str) -> Vec<DiscoverCatalog> {
+    let mut options = Vec::new();
+    for addon in addons {
+        let Some(transport_url) = addon_transport_url(addon) else { continue };
+        for catalog in addon_catalogs(addon) {
+            let Some(content_type) = catalog.get("type").and_then(Value::as_str) else { continue };
+            let Some(id) = catalog.get("id").and_then(Value::as_str) else { continue };
+            if !selected_type.is_empty() && content_type != selected_type {
+                continue;
+            }
+            options.push(DiscoverCatalog {
+                key: format!("{}:{}", transport_url, id),
+                transport_url: transport_url.to_string(),
+                content_type: content_type.to_string(),
+                id: id.to_string(),
+            });
+        }
+    }
+    options
+}
+
+fn playback_title(meta: Option<&Value>, episode: Option<&Value>, stream: &Value) -> Value {
+    let content_title = meta
+        .and_then(|value| value.get("name"))
+        .or_else(|| stream.get("title"))
+        .or_else(|| stream.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("Fluxa");
+    let season = episode.and_then(|value| value.get("season")).and_then(Value::as_i64);
+    let episode_number = episode
+        .and_then(|value| value.get("episode").or_else(|| value.get("number")))
+        .and_then(Value::as_i64);
+    let episode_name = episode
+        .and_then(|value| value.get("name").or_else(|| value.get("title")))
+        .and_then(Value::as_str);
+    let episode_line = match (season, episode_number) {
+        (Some(season), Some(number)) => {
+            let prefix = format!("S{season}:E{number}");
+            Some(match episode_name.filter(|value| !value.trim().is_empty()) {
+                Some(name) => format!("{prefix} {}", name.trim()),
+                None => prefix,
+            })
+        }
+        _ => None,
+    };
+    json!({ "contentTitle": content_title, "episodeLine": episode_line })
+}
+
+fn playback_artwork(meta: Option<&Value>, episode: Option<&Value>) -> Value {
+    let background = meta
+        .and_then(|value| first_text(value, &["background", "backgroundUrl", "backdrop", "backdropUrl"]))
+        .or_else(|| episode.and_then(|value| value.get("thumbnail")).and_then(Value::as_str))
+        .or_else(|| meta.and_then(|value| value.get("poster")).and_then(Value::as_str));
+    let logo = meta.and_then(|value| first_text(value, &["logo", "logoUrl", "titleLogo", "titleLogoUrl"]));
+    json!({ "background": background, "logo": logo })
+}
+
+fn first_text<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str).filter(|text| !text.trim().is_empty()))
+}
+
+fn normalize_preference_value(key: &str, value: Value) -> Value {
+    match key {
+        "preferredPlayer" => enum_string(value, &["mpv", "exoplayer", "external"], "mpv"),
+        "streamSourceSelectionMode" | "downloadSourceSelectionMode" => {
+            enum_string(value, &["manual", "first", "best", "regex"], "manual")
+        }
+        "downloadSubtitleLanguage" => enum_string(
+            value,
+            &["off", "preferred", "tr", "en", "ja", "es", "fr", "de"],
+            "preferred",
+        ),
+        "torrentSpeedPreset" => enum_string(value, &["default", "fast", "ultra_fast"], "default"),
+        "torrentCachePreset" => enum_string(value, &["auto", "2gb", "5gb", "10gb", "unlimited"], "auto"),
+        "subtitleSize" => enum_string(value, &["50", "75", "100", "125", "150", "200"], "100"),
+        _ => value,
+    }
+}
+
+fn enum_string(value: Value, allowed: &[&str], fallback: &str) -> Value {
+    let text = value.as_str().unwrap_or(fallback);
+    if allowed.contains(&text) {
+        Value::String(text.to_string())
+    } else {
+        Value::String(fallback.to_string())
+    }
+}
+
+fn addon_key(addon: &Value) -> String {
+    addon.get("transportUrl")
+        .or_else(|| addon.get("id"))
+        .or_else(|| addon.get("manifest").and_then(|manifest| manifest.get("id")))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}

@@ -1,0 +1,37 @@
+[package]
+name = "fluxa_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi-cli"]
+
+[features]
+default = ["native"]
+native = [
+    "dep:jni",
+]
+uniffi-cli = ["uniffi/cli"]
+wasm = []
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4.45", features = ["serde"] }
+dolby_vision = { git = "https://github.com/quietvoid/dovi_tool.git", package = "dolby_vision", default-features = false }
+jni = { version = "0.21", optional = true }
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uniffi = "0.31.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
