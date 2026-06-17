@@ -758,4 +758,34 @@ mod tests {
         );
         assert_eq!(trakt_oauth_error_code("{}"), None);
     }
+
+    #[test]
+    fn trakt_mark_watched_body_groups_episodes_by_show_and_dedupes() {
+        let body = trakt_mark_watched_body_json(
+            &json!(["tt1234567:1:1", "tt1234567:1:2", "tt1234567:1:1", "tt7654321"]).to_string(),
+        )
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .expect("body");
+
+        let movies = body["movies"].as_array().unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0]["ids"]["imdb"], "tt7654321");
+
+        let shows = body["shows"].as_array().unwrap();
+        assert_eq!(shows.len(), 1);
+        assert_eq!(shows[0]["ids"]["imdb"], "tt1234567");
+        let seasons = shows[0]["seasons"].as_array().unwrap();
+        assert_eq!(seasons.len(), 1);
+        assert_eq!(seasons[0]["number"], 1);
+        // The duplicate tt1234567:1:1 must not produce a duplicate episode entry.
+        let episodes = seasons[0]["episodes"].as_array().unwrap();
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(episodes[0]["number"], 1);
+        assert_eq!(episodes[1]["number"], 2);
+    }
+
+    #[test]
+    fn trakt_mark_watched_body_is_none_for_unrecognized_ids() {
+        assert_eq!(trakt_mark_watched_body_json(&json!(["not-an-id"]).to_string()), None);
+    }
 }

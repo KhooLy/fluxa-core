@@ -291,6 +291,27 @@ pub(crate) fn calendar_items_from_meta_json(meta_json: &str, month_prefix: &str)
     serde_json::to_string(&items).ok()
 }
 
+/// Earliest video whose `released` date is strictly in the future, or None
+/// if every video is already released, missing a date, or there are no videos.
+/// Purely date-based (no current watch position needed) — unlike
+/// `library_state::resolve_next_episode_json`, this works for items that
+/// were never started.
+pub(crate) fn next_unaired_episode_json(videos_json: &str, now_ms: i64) -> Option<String> {
+    let videos: Vec<Value> = serde_json::from_str(videos_json).ok()?;
+    let mut future: Vec<Value> = videos
+        .into_iter()
+        .filter(|v| v.get("released").and_then(Value::as_str).is_some())
+        .filter(|v| !crate::library_state::is_episode_released(v, now_ms))
+        .collect();
+    future.sort_by(|a, b| {
+        let ar = a.get("released").and_then(Value::as_str).unwrap_or("");
+        let br = b.get("released").and_then(Value::as_str).unwrap_or("");
+        ar.cmp(br)
+    });
+    let next = future.into_iter().next()?;
+    serde_json::to_string(&next).ok()
+}
+
 pub(crate) fn calendar_item_matches_month_json(item_json: &str, month_prefix: &str) -> bool {
     if month_prefix.is_empty() { return true; }
     serde_json::from_str::<Value>(item_json).ok()
@@ -379,6 +400,32 @@ mod tests {
             serde_json::from_str(&calendar_notification_content_json(&request.to_string()).unwrap())
                 .unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn next_unaired_episode_picks_earliest_future_date() {
+        let now_ms = chrono::DateTime::parse_from_rfc3339("2026-06-16T00:00:00Z").unwrap().timestamp_millis();
+        let videos = json!([
+            {"id": "v1", "released": "2026-06-01T00:00:00Z"},
+            {"id": "v2", "released": "2026-07-10T00:00:00Z"},
+            {"id": "v3", "released": "2026-06-20T00:00:00Z"},
+            {"id": "v4"}
+        ]);
+        let result: Value = serde_json::from_str(
+            &next_unaired_episode_json(&videos.to_string(), now_ms).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["id"], "v3");
+    }
+
+    #[test]
+    fn next_unaired_episode_returns_none_when_nothing_upcoming() {
+        let now_ms = chrono::DateTime::parse_from_rfc3339("2026-06-16T00:00:00Z").unwrap().timestamp_millis();
+        let videos = json!([
+            {"id": "v1", "released": "2026-06-01T00:00:00Z"},
+            {"id": "v2"}
+        ]);
+        assert!(next_unaired_episode_json(&videos.to_string(), now_ms).is_none());
     }
 
     #[test]

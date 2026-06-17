@@ -10,79 +10,90 @@ mod library;
 mod navigation;
 mod offline;
 mod player;
+mod profile;
 mod search;
 mod settings;
 mod state;
 mod sync;
 
 use crate::runtime::{EffectEnvelope, EffectKind};
-use contracts::{AppAction, DispatchResult};
+use contracts::{AppAction, DispatchResult, StatePatch};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use state::default_state;
-use std::collections::HashMap;
+use serde_json::Value;
+use state::{EngineState, GenerationKey};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use web_time::Instant;
 
 pub(crate) use contracts::EffectResultInput;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+// If the platform never calls complete_effect for an effect (a transient IPC failure on
+// the completion call, a swallowed exception, etc.), it would otherwise sit in
+// pending_effects/delivered_effect_ids forever for the life of the engine instance.
+// Anything genuinely still in flight completes well within this window.
+const EFFECT_EXPIRY: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HeadlessEngine {
     #[serde(default)]
-    state: Value,
-    #[serde(default)]
+    state: EngineState,
+    #[serde(default = "first_effect_id")]
     next_effect_id: u64,
+    // Ids handed to the platform at least once, awaiting their complete_effect call.
+    // Never serialized — purely tracks delivery so the "drain the queue" fallback in
+    // resolve_visible_effects doesn't hand out an effect that's already in flight as
+    // if it were fresh work (which used to make an unrelated dispatch while a slow
+    // effect was still running re-trigger a full duplicate execution of it).
+    #[serde(skip)]
+    delivered_effect_ids: HashSet<String>,
+    // When each pending effect was created, for expire_stale_pending_effects. Never
+    // serialized — Instant isn't a portable wall-clock value, just an internal timer.
+    #[serde(skip)]
+    effect_created_at: HashMap<String, Instant>,
 }
 
-impl Default for HeadlessEngine {
-    fn default() -> Self {
-        Self {
-            state: default_state(),
-            next_effect_id: 1,
-        }
-    }
+fn first_effect_id() -> u64 {
+    1
 }
 
 static ENGINE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ENGINES: OnceLock<Mutex<HashMap<u64, HeadlessEngine>>> = OnceLock::new();
 
 pub(crate) fn create_headless_engine(initial_json: &str) -> u64 {
-    let mut engine = HeadlessEngine::default();
-    if let Ok(initial_state) = serde_json::from_str::<Value>(initial_json) {
-        helpers::merge_object(&mut engine.state, initial_state);
+    let mut engine = HeadlessEngine { next_effect_id: 1, ..HeadlessEngine::default() };
+    if let Ok(initial_state) = serde_json::from_str::<EngineState>(initial_json) {
+        engine.state = initial_state;
     }
-    if !engine.state["pendingEffects"].is_array() {
-        engine.state["pendingEffects"] = json!([]);
-    }
-    if let Ok(mut map) = engines().lock() {
-        let handle = ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        map.insert(handle, engine);
-        handle
-    } else {
-        0
-    }
+    let mut map = lock_engines();
+    let handle = ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    map.insert(handle, engine);
+    handle
 }
 
 pub(crate) fn destroy_headless_engine(handle: u64) -> bool {
-    engines()
-        .lock()
-        .ok()
-        .and_then(|mut map| map.remove(&handle))
-        .is_some()
+    lock_engines().remove(&handle).is_some()
 }
 
 pub(crate) fn headless_engine_snapshot_json(handle: u64) -> Option<String> {
-    let map = engines().lock().ok()?;
+    let map = lock_engines();
     serde_json::to_string(&map.get(&handle)?.state).ok()
 }
 
 pub(crate) fn headless_engine_dispatch_json(handle: u64, action_json: &str) -> Option<String> {
     let action: AppAction = serde_json::from_str(action_json).ok()?;
-    let mut map = engines().lock().ok()?;
-    let engine = map.get_mut(&handle)?;
-    let effects = engine.dispatch(action);
-    engine.result_json(effects)
+    let (before, after, visible_effects) = {
+        let mut map = lock_engines();
+        let engine = map.get_mut(&handle)?;
+        engine.expire_stale_pending_effects(Instant::now());
+        let before = engine.state.clone();
+        let effects = engine.dispatch(action);
+        let visible_effects = engine.resolve_visible_effects(effects);
+        (before, engine.state.clone(), visible_effects)
+    };
+    result_patch_json(&before, &after, visible_effects)
 }
 
 pub(crate) fn headless_engine_complete_effect_json(
@@ -90,10 +101,16 @@ pub(crate) fn headless_engine_complete_effect_json(
     result_json: &str,
 ) -> Option<String> {
     let result: EffectResultInput = serde_json::from_str(result_json).ok()?;
-    let mut map = engines().lock().ok()?;
-    let engine = map.get_mut(&handle)?;
-    let effects = engine.complete_effect(result);
-    engine.result_json(effects)
+    let (before, after, visible_effects) = {
+        let mut map = lock_engines();
+        let engine = map.get_mut(&handle)?;
+        engine.expire_stale_pending_effects(Instant::now());
+        let before = engine.state.clone();
+        let effects = engine.complete_effect(result);
+        let visible_effects = engine.resolve_visible_effects(effects);
+        (before, engine.state.clone(), visible_effects)
+    };
+    result_patch_json(&before, &after, visible_effects)
 }
 
 impl HeadlessEngine {
@@ -474,79 +491,88 @@ impl HeadlessEngine {
     }
 
     fn complete_effect(&mut self, result: EffectResultInput) -> Vec<EffectEnvelope> {
-        let effect = match helpers::pending_effect(&self.state, &result.effect_id) {
-            Some(effect) => effect,
-            None => return vec![],
+        let Some(effect) = self
+            .state
+            .pending_effects
+            .iter()
+            .find(|effect| effect.id == result.effect_id)
+            .cloned()
+        else {
+            return vec![];
         };
-        let generation = effect["generation"].as_u64().unwrap_or(0);
-        let effect_type = effect["type"].as_str().unwrap_or_default().to_string();
-        helpers::remove_pending_effect(&mut self.state, &result.effect_id);
+        let generation = effect.generation;
+        // Unknown effect type (e.g. stale build mismatch between platform and core) — drop silently.
+        let Some(kind) = EffectKind::from_str(&effect.kind) else {
+            return vec![];
+        };
+        self.state.pending_effects.retain(|pending| pending.id != result.effect_id);
+        self.delivered_effect_ids.remove(&result.effect_id);
+        self.effect_created_at.remove(&result.effect_id);
+        let effect_type = kind.as_str();
 
-        match effect_type.as_str() {
-            "fetchMetaDetail"
-            | "readPlaybackProgress"
-            | "readDetailLocalState"
-            | "fetchDetailSecondary"
-            | "prefetchDetailStreams"
-            | "fetchDetailStreams"
-            | "fetchMetaDetailLookup"
-            | "fetchSeasonEpisodes" => detail::complete(self, &effect_type, generation, &result),
+        // No wildcard arm: adding an EffectKind variant without handling it here is a compile error.
+        match kind {
+            EffectKind::FetchMetaDetail
+            | EffectKind::ReadPlaybackProgress
+            | EffectKind::ReadDetailLocalState
+            | EffectKind::FetchDetailSecondary
+            | EffectKind::PrefetchDetailStreams
+            | EffectKind::FetchDetailStreams
+            | EffectKind::FetchMetaDetailLookup
+            | EffectKind::FetchSeasonEpisodes => detail::complete(self, effect_type, generation, &result),
 
-            "loadStreams"
-            | "startTorrentStream"
-            | "enqueueTraktScrobble"
-            | "stopTorrent"
-            | "fetchIntroSegments"
-            | "resolveIntroImdbId"
-            | "fetchSubtitles"
-            | "prefetchNextEpisodeStreams" => player::complete(self, &effect_type, generation, &result),
+            EffectKind::LoadStreams
+            | EffectKind::StartTorrentStream
+            | EffectKind::EnqueueTraktScrobble
+            | EffectKind::StopTorrent
+            | EffectKind::FetchIntroSegments
+            | EffectKind::ResolveIntroImdbId
+            | EffectKind::FetchSubtitles
+            | EffectKind::PrefetchNextEpisodeStreams => player::complete(self, effect_type, generation, &result),
 
-            "readHomeBootstrap" | "prepareDirectPlayback" | "fetchCatalogPage" => {
-                home::complete(self, &effect_type, generation, &result)
+            EffectKind::ReadHomeBootstrap
+            | EffectKind::PrepareDirectPlayback
+            | EffectKind::FetchCatalogPage => home::complete(self, effect_type, generation, &result),
+
+            EffectKind::ReadLibraryState
+            | EffectKind::WriteLibraryCommand
+            | EffectKind::WriteFeedback
+            | EffectKind::ClearPlaybackProgress
+            | EffectKind::WritePlaybackProgress
+            | EffectKind::SyncWatchedState => library::complete(self, effect_type, generation, &result),
+
+            EffectKind::FetchAddonManifest
+            | EffectKind::RefreshInstalledAddons
+            | EffectKind::FetchAddonResource => addons::complete(self, effect_type, generation, &result),
+
+            EffectKind::RunSearch => search::complete(self, generation, &result),
+
+            EffectKind::RunDiscover | EffectKind::ReadDiscoverCatalogFilters => {
+                discover::complete(self, effect_type, generation, &result)
             }
 
-            "readLibraryState"
-            | "writeLibraryCommand"
-            | "writeFeedback"
-            | "clearPlaybackProgress"
-            | "writePlaybackProgress"
-            | "syncWatchedState" => library::complete(self, &effect_type, generation, &result),
+            EffectKind::ReadCalendarMonth => calendar::complete(self, generation, &result, &effect),
 
-            "fetchAddonManifest" | "refreshInstalledAddons" | "fetchAddonResource" => {
-                addons::complete(self, &effect_type, generation, &result)
+            EffectKind::EnqueueOfflineDownload => offline::complete(self, generation, &result),
+
+            EffectKind::WriteSettings => settings::complete(self, generation, &result),
+
+            EffectKind::RunExternalSync | EffectKind::SyncExternalIntegration => {
+                sync::complete(self, effect_type, generation, &result)
             }
 
-            "runSearch" => search::complete(self, generation, &result),
-
-            "runDiscover" | "readDiscoverCatalogFilters" => {
-                discover::complete(self, &effect_type, generation, &result)
+            EffectKind::RunAuthFlow | EffectKind::ExchangeAuthCode | EffectKind::RefreshAuthToken => {
+                auth::complete(self, effect_type, generation, &result)
             }
 
-            "readCalendarMonth" => calendar::complete(self, generation, &result, &effect),
-
-            "enqueueOfflineDownload" => offline::complete(self, generation, &result),
-
-            "writeSettings" => settings::complete(self, generation, &result),
-
-            "runExternalSync" | "syncExternalIntegration" => {
-                sync::complete(self, &effect_type, generation, &result)
-            }
-
-            "runAuthFlow" | "exchangeAuthCode" | "refreshAuthToken" => {
-                auth::complete(self, &effect_type, generation, &result)
-            }
-
-            "updateCalendarWidget"
-            | "notifyReleasedEpisodes"
-            | "replaceExternalContinueWatching" => {
-                vec![]
-            }
-
-            _ => vec![],
+            EffectKind::UpdateCalendarWidget
+            | EffectKind::NotifyReleasedEpisodes
+            | EffectKind::ReplaceExternalContinueWatching => vec![],
         }
     }
 
-    fn effect(&mut self, kind: EffectKind, generation: u64, payload: Value) -> EffectEnvelope {
+    fn effect<P: serde::Serialize>(&mut self, kind: EffectKind, generation: u64, payload: P) -> EffectEnvelope {
+        let payload = serde_json::to_value(&payload).unwrap_or(Value::Null);
         self.effect_raw(kind.as_str(), generation, payload)
     }
 
@@ -555,50 +581,96 @@ impl HeadlessEngine {
     fn effect_raw(&mut self, kind: &str, generation: u64, payload: Value) -> EffectEnvelope {
         let id = format!("fx-{}", self.next_effect_id);
         self.next_effect_id += 1;
-        let envelope = EffectEnvelope::raw(id, kind, generation, payload);
-        if let Ok(as_value) = serde_json::to_value(&envelope) {
-            if let Some(arr) = self.state["pendingEffects"].as_array_mut() {
-                arr.push(as_value);
-            }
-        }
+        let envelope = EffectEnvelope::raw(id.clone(), kind, generation, payload);
+        self.state.pending_effects.push(envelope.clone());
+        self.effect_created_at.insert(id, Instant::now());
         envelope
     }
 
-    fn bump_generation(&mut self, key: &str) -> u64 {
-        let next = helpers::current_generation(&self.state, key).saturating_add(1);
-        self.state["_runtime"][key] = json!(next);
-        next
+    // Drops any pending effect old enough that it's almost certainly been abandoned by
+    // the platform rather than genuinely still in flight. Called opportunistically on
+    // every dispatch/complete_effect so no background timer is needed.
+    fn expire_stale_pending_effects(&mut self, now: Instant) {
+        let stale_ids: Vec<String> = self
+            .state
+            .pending_effects
+            .iter()
+            .filter(|effect| {
+                self.effect_created_at
+                    .get(&effect.id)
+                    .is_some_and(|created_at| now.duration_since(*created_at) > EFFECT_EXPIRY)
+            })
+            .map(|effect| effect.id.clone())
+            .collect();
+        for id in &stale_ids {
+            self.state.pending_effects.retain(|effect| &effect.id != id);
+            self.delivered_effect_ids.remove(id);
+            self.effect_created_at.remove(id);
+        }
     }
 
-    fn result_json(&self, effects: Vec<EffectEnvelope>) -> Option<String> {
-        // When a complete_effect handler produces no new effects, we return all
-        // remaining pendingEffects so the platform can drain the queue in one pass.
-        let visible_effects = if effects.is_empty() {
-            self.state["pendingEffects"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| serde_json::from_value(v).ok())
-                .collect()
+    fn bump_generation(&mut self, key: GenerationKey) -> u64 {
+        self.state.runtime.bump(key)
+    }
+
+    // When a dispatch/complete_effect handler produces no new effects directly, we
+    // fall back to draining whatever's still pending so the platform doesn't lose
+    // track of multi-effect work spread across several calls. But anything already
+    // handed to the platform is presumably still in flight (e.g. an addon fetch that
+    // hasn't finished) — redelivering it here would make the platform start a second,
+    // duplicate execution of the same effect. Only ever drain genuinely undelivered ones.
+    fn resolve_visible_effects(&mut self, effects: Vec<EffectEnvelope>) -> Vec<EffectEnvelope> {
+        let visible = if effects.is_empty() {
+            self.undelivered_pending_effects()
         } else {
             effects
         };
-        serde_json::to_string(&DispatchResult {
-            state: self.state.clone(),
-            effects: visible_effects,
-        })
-        .ok()
+        for effect in &visible {
+            self.delivered_effect_ids.insert(effect.id.clone());
+        }
+        visible
     }
+
+    fn undelivered_pending_effects(&self) -> Vec<EffectEnvelope> {
+        self.state
+            .pending_effects
+            .iter()
+            .filter(|effect| !self.delivered_effect_ids.contains(&effect.id))
+            .cloned()
+            .collect()
+    }
+}
+
+// Deliberately takes owned before/after snapshots rather than a reference to the locked
+// engine: diffing and serializing a large state (e.g. a big discover catalog) can take
+// over a second, and every other Tauri command shares one global engine mutex — holding
+// it for that long would stall unrelated IPC calls behind it. Callers clone what they
+// need and drop the lock before calling this.
+fn result_patch_json(before: &EngineState, after: &EngineState, effects: Vec<EffectEnvelope>) -> Option<String> {
+    serde_json::to_string(&DispatchResult {
+        state: StatePatch::diff(before, after),
+        effects,
+    })
+    .ok()
 }
 
 fn engines() -> &'static Mutex<HashMap<u64, HeadlessEngine>> {
     ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// A panic while a request held this lock poisons it; with catch_unwind now
+// guarding the FFI boundary, a single caught panic must not silently make
+// every engine handle inaccessible for the rest of the process's life.
+// Recovering the guard accepts that one engine's state might be left
+// mid-update, which is still far better than every other handle going dark.
+fn lock_engines() -> std::sync::MutexGuard<'static, HashMap<u64, HeadlessEngine>> {
+    engines().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn detail_load_emits_platform_effects_and_completion_updates_state() {
@@ -787,8 +859,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(completed["state"]["detail"]["id"], "tt2");
-        assert!(completed["state"]["detail"]["meta"].is_null());
+        // Stale completion is ignored, so this dispatch's patch doesn't touch detail at all —
+        // its absence here is what proves tt2's state wasn't overridden by tt1's late result.
+        assert!(completed["state"]["detail"].is_null());
         assert!(destroy_headless_engine(handle));
     }
 
@@ -1022,7 +1095,60 @@ mod tests {
     }
 
     #[test]
-    fn effect_completion_returns_remaining_pending_effects_for_adapter_drain() {
+    fn clearing_playback_progress_drops_the_item_from_home_continue_watching() {
+        let handle = create_headless_engine(r#"{"profile":{"activeProfileId":"p1"}}"#);
+        headless_engine_dispatch_json(
+            handle,
+            r#"{"type":"homeLoadRequested","profile":{"id":"p1"}}"#,
+        )
+        .unwrap();
+        let home_loaded: Value = serde_json::from_str(
+            &headless_engine_complete_effect_json(
+                handle,
+                &json!({
+                    "effectId": "fx-1",
+                    "status": "ok",
+                    "value": { "continueWatching": [{ "id": "tt1" }, { "id": "tt2" }] }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(home_loaded["state"]["home"]["continueWatching"].as_array().unwrap().len(), 2);
+
+        let requested: Value = serde_json::from_str(
+            &headless_engine_dispatch_json(
+                handle,
+                r#"{"type":"clearPlaybackProgressRequested","meta":{"id":"tt1"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let effect_id = requested["effects"][0]["id"].as_str().unwrap();
+
+        let completed: Value = serde_json::from_str(
+            &headless_engine_complete_effect_json(
+                handle,
+                &json!({
+                    "effectId": effect_id,
+                    "status": "ok",
+                    "value": { "droppedId": "tt1" }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let continue_watching = completed["state"]["home"]["continueWatching"].as_array().unwrap();
+        assert_eq!(continue_watching.len(), 1);
+        assert_eq!(continue_watching[0]["id"], "tt2");
+        assert!(destroy_headless_engine(handle));
+    }
+
+    #[test]
+    fn completing_an_effect_does_not_redeliver_already_delivered_siblings() {
         let handle = create_headless_engine("{}");
         let requested: Value = serde_json::from_str(
             &headless_engine_dispatch_json(
@@ -1032,6 +1158,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // dispatch_load creates and delivers both effects directly in one response.
+        assert_eq!(requested["effects"][0]["type"], "fetchMetaDetail");
+        assert_eq!(requested["effects"][1]["type"], "readPlaybackProgress");
 
         let completed: Value = serde_json::from_str(
             &headless_engine_complete_effect_json(
@@ -1047,8 +1176,35 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(completed["effects"][0]["type"], "readPlaybackProgress");
+        // readPlaybackProgress was already handed to the platform alongside fetchMetaDetail.
+        // Completing fetchMetaDetail must not hand it out again as if it were fresh work —
+        // the platform is presumably still executing it.
+        assert!(completed["effects"].as_array().unwrap().is_empty());
         assert!(destroy_headless_engine(handle));
+    }
+
+    #[test]
+    fn expire_stale_pending_effects_drops_old_but_not_recent_effects() {
+        let mut engine = HeadlessEngine::default();
+        let action: AppAction = serde_json::from_str(
+            r#"{"type":"detailLoadRequested","contentType":"movie","id":"tt1","language":"en"}"#,
+        )
+        .unwrap();
+        let effects = engine.dispatch(action);
+        let visible = engine.resolve_visible_effects(effects);
+        assert_eq!(visible.len(), 2);
+
+        // Still well within the window — nothing genuinely in flight should be dropped.
+        engine.expire_stale_pending_effects(Instant::now());
+        assert_eq!(engine.state.pending_effects.len(), 2);
+
+        // Past the expiry window — abandoned effects (platform never called
+        // complete_effect) get swept from all three bookkeeping collections.
+        let far_future = Instant::now() + Duration::from_secs(301);
+        engine.expire_stale_pending_effects(far_future);
+        assert!(engine.state.pending_effects.is_empty());
+        assert!(engine.delivered_effect_ids.is_empty());
+        assert!(engine.effect_created_at.is_empty());
     }
 
     #[test]
@@ -1308,8 +1464,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        // Guard works: prefetchingNextVideoId unchanged, no new prefetch effect was queued.
-        assert_eq!(duplicate["state"]["player"]["prefetchingNextVideoId"], "tt1:1:2");
+        // Guard works: nothing in player changed, so it's correctly absent from this patch
+        // entirely (no new prefetch effect was queued either).
+        assert!(duplicate["state"]["player"].is_null());
 
         // 2. Platform completes the prefetch with streams for tt1:1:2
         let effect_id = prefetch_requested["effects"][0]["id"].as_str().unwrap();
@@ -1352,6 +1509,24 @@ mod tests {
         // Cache must be consumed (cleared) after use
         assert!(load["state"]["player"]["prefetchedNextEpisode"].is_null());
 
+        assert!(destroy_headless_engine(handle));
+    }
+
+    #[test]
+    fn engines_lock_survives_a_panic_while_held_by_another_thread() {
+        // Poison the lock the same way a caught panic in a request would: a
+        // thread panics while still holding the guard.
+        let poisoner = std::thread::spawn(|| {
+            let _guard = engines().lock().unwrap();
+            panic!("simulated panic while holding the engines lock");
+        });
+        assert!(poisoner.join().is_err());
+
+        // A naive `.lock().ok()` would now return None forever; lock_engines
+        // must recover the guard so the store keeps working.
+        let handle = create_headless_engine("{}");
+        assert!(handle > 0);
+        assert!(headless_engine_snapshot_json(handle).is_some());
         assert!(destroy_headless_engine(handle));
     }
 }

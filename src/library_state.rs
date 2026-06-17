@@ -326,7 +326,42 @@ pub(crate) fn compute_continue_watching_badges_json(
     // is available to confirm a next episode exists, preventing phantom CW entries.
     let cw_list_ids: std::collections::HashSet<String> = by_id.keys().cloned().collect();
 
-    for (series_id, raw) in &last_watched {
+    seed_candidates_from_last_watched(&mut by_id, &last_watched);
+
+    let mut finished_series: Vec<String> = Vec::new();
+    for (series_id, candidate) in by_id.iter_mut() {
+        let next = match next_episode_for_candidate(series_id, candidate, &videos_by_series, &cw_list_ids) {
+            NextEpisodeOutcome::Skip => continue,
+            NextEpisodeOutcome::MarkFinished => {
+                finished_series.push(series_id.clone());
+                continue;
+            }
+            NextEpisodeOutcome::Found(next) => next,
+        };
+        apply_next_episode_badge(series_id, candidate, &next, now_ms);
+    }
+
+    for id in &finished_series { by_id.remove(id); }
+    let mut result: Vec<Value> = by_id.into_values().collect();
+    result.sort_by(|a, b| {
+        let a_new = a.get("continueWatchingBadge").and_then(Value::as_str) == Some("newEpisode");
+        let b_new = b.get("continueWatchingBadge").and_then(Value::as_str) == Some("newEpisode");
+        if a_new != b_new { return if a_new { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }; }
+        let a_time = a.get("savedAt").or_else(|| a.get("newEpisodeReleasedAt")).and_then(Value::as_str).unwrap_or("");
+        let b_time = b.get("savedAt").or_else(|| b.get("newEpisodeReleasedAt")).and_then(Value::as_str).unwrap_or("");
+        b_time.cmp(a_time)
+    });
+    serde_json::to_string(&result).ok()
+}
+
+// Adds a synthetic CW candidate for any series that only has a lastWatchedEpisodes
+// record (no real continue-watching entry yet) so its next-episode badge still gets
+// computed below; `by_id.entry(...).or_insert_with` leaves real entries untouched.
+fn seed_candidates_from_last_watched(
+    by_id: &mut std::collections::HashMap<String, Value>,
+    last_watched: &serde_json::Map<String, Value>,
+) {
+    for (series_id, raw) in last_watched {
         let meta = match raw.get("meta") { Some(m) if m.get("type").and_then(Value::as_str) == Some("series") => m, _ => continue };
         let record = raw;
         by_id.entry(series_id.clone()).or_insert_with(|| json!({
@@ -347,116 +382,127 @@ pub(crate) fn compute_continue_watching_badges_json(
             "savedAt": record.get("watchedAt").cloned().unwrap_or(Value::Null),
         }));
     }
+}
 
-    let mut finished_series: Vec<String> = Vec::new();
-    for (series_id, candidate) in by_id.iter_mut() {
-        if candidate.get("type").and_then(Value::as_str) != Some("series") { continue; }
-        if !is_up_next_item(candidate) { continue; }
-        let season = match candidate.get("lastEpisodeSeason").and_then(Value::as_i64) { Some(s) => s, None => continue };
-        let episode = match candidate.get("lastEpisodeNumber").and_then(Value::as_i64) { Some(e) => e, None => continue };
-        let videos = match videos_by_series.get(series_id).and_then(Value::as_array) {
-            Some(v) => v,
-            None => {
-                // No video data available. If this entry exists only because of
-                // lastWatchedEpisodes (not from any real CW list), conservatively
-                // remove it — we cannot confirm a next episode exists. It will
-                // reappear on the next home load once the addon responds.
-                if !cw_list_ids.contains(series_id) {
-                    finished_series.push(series_id.clone());
-                }
-                continue;
-            }
-        };
-        let stored_badge = candidate.get("continueWatchingBadge").and_then(Value::as_str);
-        let stored_video_id = candidate.get("lastVideoId").and_then(Value::as_str).unwrap_or("").to_string();
+enum NextEpisodeOutcome {
+    Skip,
+    MarkFinished,
+    Found(Value),
+}
 
-        // When the stored badge is scheduledEpisode, lastEpisodeNumber already points to the
-        // scheduled episode itself. Re-check that same episode rather than advancing past it.
-        let next = if stored_badge == Some("scheduledEpisode") {
-            videos.iter().find(|v| {
-                let vid = v.get("id").or_else(|| v.get("_id")).and_then(Value::as_str).unwrap_or("");
-                vid == stored_video_id
-            }).cloned().or_else(|| first_episode_after(videos, season, episode))
-        } else {
-            first_episode_after(videos, season, episode)
-        };
-        // No next episode and we have real video data — the series is fully watched.
-        // Remove it from Continue Watching instead of leaving a zombie entry.
-        let next = match next {
-            Some(v) => v,
-            None => { finished_series.push(series_id.clone()); continue; }
-        };
-
-        let existing_video_id = stored_video_id;
-        let next_id = next.get("id").or_else(|| next.get("_id")).and_then(Value::as_str)
-            .unwrap_or(&existing_video_id).to_string();
-        if !is_up_next_item(candidate) && existing_video_id != next_id { continue; }
-        let is_new_target = existing_video_id != next_id;
-        let is_released = is_episode_released(&next, now_ms);
-        let existing_badge = if !is_new_target { candidate.get("continueWatchingBadge").and_then(Value::as_str).map(str::to_string) } else { None };
-
-        let badge = if !is_released {
-            "scheduledEpisode"
-        } else if existing_badge.as_deref() == Some("scheduledEpisode") {
-            "newEpisode"
-        } else if existing_badge.is_some() {
-            existing_badge.as_deref().unwrap()
-        } else {
-            let watched_at = candidate.get("savedAt").and_then(Value::as_str)
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp_millis()).unwrap_or(now_ms);
-            let next_released_at = next.get("released").and_then(Value::as_str)
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp_millis()).unwrap_or(0);
-            let was_released_when_watched = next.get("released").is_none() || next_released_at <= watched_at;
-            if was_released_when_watched { "upNext" } else { "newEpisode" }
-        }.to_string();
-
-        let released_str = next.get("released").and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        let saved_at_new = if is_new_target && badge == "newEpisode" {
-            Value::String(chrono::Utc::now().to_rfc3339())
-        } else {
-            candidate.get("savedAt").cloned().unwrap_or(Value::Null)
-        };
-
-        *candidate = json!({
-            "id": series_id,
-            "_id": series_id,
-            "type": "series",
-            "name": candidate.get("name").cloned().unwrap_or(Value::Null),
-            "poster": candidate.get("poster").cloned().unwrap_or(Value::Null),
-            "background": candidate.get("background").cloned().unwrap_or(Value::Null),
-            "logo": candidate.get("logo").cloned().unwrap_or(Value::Null),
-            "timeOffset": 1,
-            "duration": 99999,
-            "lastVideoId": next_id,
-            "lastEpisodeName": next.get("name").or_else(|| next.get("title")).cloned().unwrap_or(Value::Null),
-            "lastEpisodeSeason": next.get("season").cloned().unwrap_or(Value::Null),
-            "lastEpisodeNumber": next.get("episode").or_else(|| next.get("number")).cloned().unwrap_or(Value::Null),
-            "lastEpisodeThumbnail": next.get("thumbnail")
-                .filter(|v| !v.is_null())
-                .cloned()
-                .or_else(|| if !is_new_target { candidate.get("lastEpisodeThumbnail").cloned().filter(|v| !v.is_null()) } else { None })
-                .unwrap_or(Value::Null),
-            "continueWatchingBadge": badge,
-            "newEpisodeReleasedAt": released_str,
-            "savedAt": saved_at_new,
-        });
+// Decides what's next for one candidate: skip it untouched, mark its series as
+// finished (to be dropped from the result), or hand back the episode to advance to.
+fn next_episode_for_candidate(
+    series_id: &str,
+    candidate: &Value,
+    videos_by_series: &serde_json::Map<String, Value>,
+    cw_list_ids: &std::collections::HashSet<String>,
+) -> NextEpisodeOutcome {
+    if candidate.get("type").and_then(Value::as_str) != Some("series") {
+        return NextEpisodeOutcome::Skip;
     }
+    if !is_up_next_item(candidate) {
+        return NextEpisodeOutcome::Skip;
+    }
+    let Some(season) = candidate.get("lastEpisodeSeason").and_then(Value::as_i64) else {
+        return NextEpisodeOutcome::Skip;
+    };
+    let Some(episode) = candidate.get("lastEpisodeNumber").and_then(Value::as_i64) else {
+        return NextEpisodeOutcome::Skip;
+    };
+    let Some(videos) = videos_by_series.get(series_id).and_then(Value::as_array) else {
+        // No video data available. If this entry exists only because of
+        // lastWatchedEpisodes (not from any real CW list), conservatively
+        // remove it — we cannot confirm a next episode exists. It will
+        // reappear on the next home load once the addon responds.
+        return if !cw_list_ids.contains(series_id) {
+            NextEpisodeOutcome::MarkFinished
+        } else {
+            NextEpisodeOutcome::Skip
+        };
+    };
+    let stored_badge = candidate.get("continueWatchingBadge").and_then(Value::as_str);
+    let stored_video_id = candidate.get("lastVideoId").and_then(Value::as_str).unwrap_or("").to_string();
 
-    for id in &finished_series { by_id.remove(id); }
-    let mut result: Vec<Value> = by_id.into_values().collect();
-    result.sort_by(|a, b| {
-        let a_new = a.get("continueWatchingBadge").and_then(Value::as_str) == Some("newEpisode");
-        let b_new = b.get("continueWatchingBadge").and_then(Value::as_str) == Some("newEpisode");
-        if a_new != b_new { return if a_new { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }; }
-        let a_time = a.get("savedAt").or_else(|| a.get("newEpisodeReleasedAt")).and_then(Value::as_str).unwrap_or("");
-        let b_time = b.get("savedAt").or_else(|| b.get("newEpisodeReleasedAt")).and_then(Value::as_str).unwrap_or("");
-        b_time.cmp(a_time)
+    // When the stored badge is scheduledEpisode, lastEpisodeNumber already points to the
+    // scheduled episode itself. Re-check that same episode rather than advancing past it.
+    let next = if stored_badge == Some("scheduledEpisode") {
+        videos.iter().find(|v| {
+            let vid = v.get("id").or_else(|| v.get("_id")).and_then(Value::as_str).unwrap_or("");
+            vid == stored_video_id
+        }).cloned().or_else(|| first_episode_after(videos, season, episode))
+    } else {
+        first_episode_after(videos, season, episode)
+    };
+
+    // No next episode and we have real video data — the series is fully watched.
+    // Remove it from Continue Watching instead of leaving a zombie entry.
+    match next {
+        Some(v) => NextEpisodeOutcome::Found(v),
+        None => NextEpisodeOutcome::MarkFinished,
+    }
+}
+
+// Computes the badge (upNext / newEpisode / scheduledEpisode) for advancing `candidate`
+// to `next`, and rewrites `candidate` in place to point at that episode.
+fn apply_next_episode_badge(series_id: &str, candidate: &mut Value, next: &Value, now_ms: i64) {
+    let existing_video_id = candidate.get("lastVideoId").and_then(Value::as_str).unwrap_or("").to_string();
+    let next_id = next.get("id").or_else(|| next.get("_id")).and_then(Value::as_str)
+        .unwrap_or(&existing_video_id).to_string();
+    if !is_up_next_item(candidate) && existing_video_id != next_id { return; }
+    let is_new_target = existing_video_id != next_id;
+    let is_released = is_episode_released(next, now_ms);
+    let existing_badge = if !is_new_target { candidate.get("continueWatchingBadge").and_then(Value::as_str).map(str::to_string) } else { None };
+
+    let badge = if !is_released {
+        "scheduledEpisode"
+    } else if existing_badge.as_deref() == Some("scheduledEpisode") {
+        "newEpisode"
+    } else if let Some(b) = existing_badge.as_deref() {
+        b
+    } else {
+        let watched_at = candidate.get("savedAt").and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp_millis()).unwrap_or(now_ms);
+        let next_released_at = next.get("released").and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp_millis()).unwrap_or(0);
+        let was_released_when_watched = next.get("released").is_none() || next_released_at <= watched_at;
+        if was_released_when_watched { "upNext" } else { "newEpisode" }
+    }.to_string();
+
+    let released_str = next.get("released").and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let saved_at_new = if is_new_target && badge == "newEpisode" {
+        Value::String(chrono::Utc::now().to_rfc3339())
+    } else {
+        candidate.get("savedAt").cloned().unwrap_or(Value::Null)
+    };
+
+    *candidate = json!({
+        "id": series_id,
+        "_id": series_id,
+        "type": "series",
+        "name": candidate.get("name").cloned().unwrap_or(Value::Null),
+        "poster": candidate.get("poster").cloned().unwrap_or(Value::Null),
+        "background": candidate.get("background").cloned().unwrap_or(Value::Null),
+        "logo": candidate.get("logo").cloned().unwrap_or(Value::Null),
+        "timeOffset": 1,
+        "duration": 99999,
+        "lastVideoId": next_id,
+        "lastEpisodeName": next.get("name").or_else(|| next.get("title")).cloned().unwrap_or(Value::Null),
+        "lastEpisodeSeason": next.get("season").cloned().unwrap_or(Value::Null),
+        "lastEpisodeNumber": next.get("episode").or_else(|| next.get("number")).cloned().unwrap_or(Value::Null),
+        "lastEpisodeThumbnail": next.get("thumbnail")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .or_else(|| if !is_new_target { candidate.get("lastEpisodeThumbnail").cloned().filter(|v| !v.is_null()) } else { None })
+            .unwrap_or(Value::Null),
+        "continueWatchingBadge": badge,
+        "newEpisodeReleasedAt": released_str,
+        "savedAt": saved_at_new,
     });
-    serde_json::to_string(&result).ok()
 }
 
 fn first_episode_after(videos: &[Value], season: i64, episode: i64) -> Option<Value> {
@@ -476,7 +522,7 @@ fn first_episode_after(videos: &[Value], season: i64, episode: i64) -> Option<Va
     candidates.first().map(|v| (*v).clone())
 }
 
-fn is_episode_released(video: &Value, now_ms: i64) -> bool {
+pub(crate) fn is_episode_released(video: &Value, now_ms: i64) -> bool {
     let released = match video.get("released").and_then(Value::as_str) {
         Some(s) => s,
         None => return true,
@@ -554,16 +600,18 @@ pub(crate) fn format_episode_line_json(
     let mut season = last_episode_season;
     let mut episode = last_episode_number;
 
-    if (season.is_none() || episode.is_none()) && last_video_id.is_some_and(|id| !id.is_empty()) {
-        let parts: Vec<&str> = last_video_id.unwrap().split(':').collect();
-        if parts.len() >= 3 {
-            if let (Ok(s), Ok(e)) = (
-                parts[parts.len() - 2].parse::<i64>(),
-                parts[parts.len() - 1].parse::<i64>(),
-            ) {
-                if s > 0 && e > 0 {
-                    if season.is_none() { season = Some(s); }
-                    if episode.is_none() { episode = Some(e); }
+    if season.is_none() || episode.is_none() {
+        if let Some(id) = last_video_id.filter(|id| !id.is_empty()) {
+            let parts: Vec<&str> = id.split(':').collect();
+            if parts.len() >= 3 {
+                if let (Ok(s), Ok(e)) = (
+                    parts[parts.len() - 2].parse::<i64>(),
+                    parts[parts.len() - 1].parse::<i64>(),
+                ) {
+                    if s > 0 && e > 0 {
+                        if season.is_none() { season = Some(s); }
+                        if episode.is_none() { episode = Some(e); }
+                    }
                 }
             }
         }
@@ -635,6 +683,32 @@ pub(crate) fn select_continue_watching_artwork_json(
     result
 }
 
+/// Batched form of select_continue_watching_artwork_json + format_episode_line_json for
+/// a whole Continue Watching row at once — each card used to call both over IPC
+/// individually, which meant one IPC round trip per card on every Home load.
+pub(crate) fn continue_watching_card_fields_json(
+    items_json: &str,
+    artwork_preference: &str,
+    is_horizontal: bool,
+) -> Option<String> {
+    let items: Vec<Value> = serde_json::from_str(items_json).ok()?;
+    let fields: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let artwork = select_continue_watching_artwork_json(&item.to_string(), artwork_preference, is_horizontal);
+            let episode_line = format_episode_line_json(
+                item.get("lastEpisodeName").and_then(Value::as_str),
+                item.get("lastEpisodeSeason").and_then(Value::as_i64),
+                item.get("lastEpisodeNumber").and_then(Value::as_i64),
+                item.get("lastVideoId").and_then(Value::as_str),
+            );
+            json!({ "id": id, "artwork": artwork, "episodeLine": episode_line })
+        })
+        .collect();
+    serde_json::to_string(&fields).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,5 +740,55 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn continue_watching_badges_advance_to_next_episode_and_drop_unconfirmed_finished_series() {
+        let candidates = json!([{
+            "id": "s1",
+            "_id": "s1",
+            "type": "series",
+            "lastVideoId": "s1:1:2",
+            "lastEpisodeSeason": 1,
+            "lastEpisodeNumber": 2,
+            "timeOffset": 1,
+            "duration": 99999,
+            "savedAt": "2020-02-01T00:00:00Z",
+        }]);
+        let videos_by_series = json!({
+            "s1": [
+                { "id": "s1:1:2", "season": 1, "episode": 2, "released": "2020-01-01T00:00:00Z" },
+                { "id": "s1:1:3", "season": 1, "episode": 3, "released": "2020-01-08T00:00:00Z" },
+            ],
+        });
+        // s3 exists only via lastWatchedEpisodes (no real CW entry, no video data) —
+        // it should be dropped rather than left as a zombie entry.
+        let last_watched = json!({
+            "s3": {
+                "meta": { "type": "series", "name": "Only From Last Watched" },
+                "lastVideoId": "s3:1:1",
+                "lastEpisodeSeason": 1,
+                "lastEpisodeNumber": 1,
+                "watchedAt": "2020-01-01T00:00:00Z",
+            },
+        });
+        let now_ms = chrono::DateTime::parse_from_rfc3339("2021-01-01T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+
+        let result = compute_continue_watching_badges_json(
+            &candidates.to_string(),
+            &videos_by_series.to_string(),
+            &last_watched.to_string(),
+            now_ms,
+        )
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .expect("badges");
+        let result = result.as_array().unwrap();
+
+        assert_eq!(result.len(), 1, "s3 (no video data, not from a real CW list) should be dropped");
+        assert_eq!(result[0]["id"], "s1");
+        assert_eq!(result[0]["lastVideoId"], "s1:1:3");
+        assert_eq!(result[0]["continueWatchingBadge"], "upNext");
     }
 }

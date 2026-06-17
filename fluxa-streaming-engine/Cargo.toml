@@ -7,10 +7,6 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "fluxa_play"
-path = "src/bin/fluxa_play.rs"
-
-[[bin]]
 name = "torrent_bench"
 path = "src/bin/torrent_bench.rs"
 
@@ -18,31 +14,44 @@ path = "src/bin/torrent_bench.rs"
 name = "torrent_serve"
 path = "src/bin/torrent_serve.rs"
 
+[[bin]]
+name = "companion_server"
+path = "src/bin/companion_server.rs"
+
 [features]
 default = ["native"]
 native = [
     "dep:axum",
+    "dep:fluxa_core",
     "dep:jni",
     "dep:librqbit",
     "dep:reqwest",
     "dep:tokio",
     "dep:tokio-util",
+    "dep:tower-http",
+    "dep:url",
 ]
 
 [dependencies]
 axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 dolby_vision = { git = "https://github.com/quietvoid/dovi_tool.git", package = "dolby_vision", default-features = false }
+fluxa_core = { path = "..", default-features = false, optional = true }
 jni = { version = "0.21", optional = true }
 librqbit = { version = "8.1.1", default-features = false, features = ["rust-tls", "disable-upload"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "process", "fs", "macros"], optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
+url = { version = "2", optional = true }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = "debuginfo"
-panic = "abort"
+# Must stay "unwind" — bindings/jni.rs catch_unwind at the FFI boundary so a
+# panic in the streaming/rewrite logic becomes a safe null/false return
+# instead of aborting the host app. "abort" would silently defeat that.
+panic = "unwind"

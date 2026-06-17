@@ -132,8 +132,6 @@ pub(crate) fn player_backend_selection_json(request_json: &str) -> Option<String
     .ok()
 }
 
-/// Determine fallback file indexes to try when the primary torrent file fails validation.
-/// Excludes the rejected index and prioritizes by file size.
 pub(crate) fn torrent_fallback_file_policy_json(request_json: &str) -> Option<String> {
     let request = serde_json::from_str::<TorrentFallbackRequest>(request_json).ok()?;
     let rejected = request.rejected_index;
@@ -350,8 +348,6 @@ pub(crate) fn player_source_sidebar_plan_json(request_json: &str) -> Option<Stri
     }))
     .ok()
 }
-
-// ── DV proxy plan ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -969,13 +965,9 @@ mod tests {
         assert!(result["delayMs"].as_i64().unwrap() > 0);
     }
 
-    // ── dv_proxy_plan_json ─────────────────────────────────────────────────────
-
     fn plan(json: &str) -> Value {
         serde_json::from_str(&dv_proxy_plan_json(json).unwrap()).unwrap()
     }
-
-    // ── Routing / mode gates ───────────────────────────────────────────────────
 
     #[test]
     fn dv_proxy_off_mode_returns_none() {
@@ -1011,8 +1003,6 @@ mod tests {
         assert_eq!(p["action"], "none");
         assert_eq!(p["reason"], "hw_dv_decoder");
     }
-
-    // ── Safety gates: profiles with no HDR base layer ─────────────────────────
 
     #[test]
     fn dv_proxy_p5_no_dv_decoder_returns_none() {
@@ -1050,8 +1040,6 @@ mod tests {
         assert_eq!(p["action"], "none");
         assert_eq!(p["reason"], "unknown_profile_no_safe_fallback");
     }
-
-    // ── Profile-specific actions and safety levels ─────────────────────────────
 
     #[test]
     fn dv_proxy_p7_mkv_auto_gives_dvcc_strip_medium_safety() {
@@ -1098,8 +1086,6 @@ mod tests {
         assert_eq!(p["compatibility"], "HDR10");
     }
 
-    // ── rpu_convert: only for raw Annex-B HEVC ────────────────────────────────
-
     #[test]
     fn dv_proxy_p7_raw_hevc_dv8_mode_gives_rpu_convert() {
         let p = plan(r#"{"stream":{"dvProfile":7},"url":"https://cdn.example/stream.hevc","fallbackMode":"dv8","deviceHasDvDecoder":false}"#);
@@ -1130,8 +1116,6 @@ mod tests {
         assert_eq!(p["action"], "dvcc_strip");
         assert_eq!(p["reason"], "rpu_convert_rejected_not_annexb");
     }
-
-    // ── DV text detection ──────────────────────────────────────────────────────
 
     #[test]
     fn dv_detection_dolby_vision_p8_text_gives_action() {
@@ -1207,10 +1191,7 @@ mod tests {
         assert_eq!(p["profile"], "P7");
     }
 
-    // ── Realistic sample stream matrix ─────────────────────────────────────────
-    //
-    // These tests mirror what real Stremio addon stream objects look like,
-    // verifying the full plan output (action, profile, compatibility, safety).
+    // These tests mirror real Stremio addon stream objects, covering the full plan output.
 
     #[test]
     fn sample_p5_dvonly_no_fallback() {
@@ -1335,8 +1316,6 @@ mod tests {
         assert_eq!(p["compatibility"], "DV8");
         assert_eq!(p["rpuMode"], 2);
     }
-
-    // ── convert_dv81 mode ──────────────────────────────────────────────────────
 
     #[test]
     fn convert_dv81_p7_mkv_decoder_no_display_returns_rpu_convert() {

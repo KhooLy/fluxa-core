@@ -1,6 +1,12 @@
 use serde::Deserialize;
 use crate::{addon_protocol, content_identity};
 use serde_json::{json, Value};
+use std::collections::HashSet;
+
+// Discover aggregates results from every installed addon's catalogs — with enough
+// addons installed, that's thousands of items in one IPC payload. Cap it after
+// dedup/sort so a single discover fetch can't balloon into multi-megabyte responses.
+const DISCOVER_MAX_ITEMS: usize = 400;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -374,6 +380,14 @@ pub(crate) fn discover_sort_plan_json(request_json: &str) -> Option<String> {
         })
         .collect();
 
+    let mut seen_ids: HashSet<&str> = HashSet::with_capacity(filtered.len());
+    filtered.retain(|item| {
+        match item.get("id").and_then(Value::as_str) {
+            Some(id) => seen_ids.insert(id),
+            None => true,
+        }
+    });
+
     match sort_by {
         "year" => {
             filtered.sort_by(|a, b| {
@@ -403,11 +417,14 @@ pub(crate) fn discover_sort_plan_json(request_json: &str) -> Option<String> {
         _ => {}
     }
 
+    let total_count = filtered.len();
+    filtered.truncate(DISCOVER_MAX_ITEMS);
+
     serde_json::to_string(&json!({
         "items": filtered,
         "sortBy": sort_by,
         "ascending": request.ascending,
-        "totalCount": filtered.len()
+        "totalCount": total_count
     }))
     .ok()
 }

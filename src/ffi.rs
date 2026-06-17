@@ -38,19 +38,62 @@ fn fail(kind: ErrorKind, message: impl Into<String>) -> CallError {
 type Outcome = Result<Value, CallError>;
 
 pub fn core_invoke(method: &str, args_json: &str) -> String {
-    match route(method, args_json) {
-        Ok(value) => json!({ "ok": true, "value": value }).to_string(),
-        Err(e) => json!({
+    // A panic anywhere in route()/the domain modules must not take the host
+    // process down with it — catch it here and hand back the same error
+    // envelope shape callers already handle for any other failure.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(method, args_json)));
+    match outcome {
+        Ok(Ok(value)) => json!({ "ok": true, "value": value }).to_string(),
+        Ok(Err(e)) => json!({
             "ok": false,
             "error": { "kind": e.kind.as_str(), "message": e.message, "method": method },
+        })
+        .to_string(),
+        Err(_) => json!({
+            "ok": false,
+            "error": { "kind": ErrorKind::Internal.as_str(), "message": "internal panic", "method": method },
         })
         .to_string(),
     }
 }
 
+// Each route_* function owns one domain's method names. `route` tries them in
+// turn and moves to the next as long as a function reports the method isn't
+// one of its own (signaled by the UnknownMethod error its catch-all arm
+// produces) — so every method is still handled by exactly one place, just
+// grouped by domain instead of one 500+ line match.
+const ROUTERS: &[fn(&str, &str) -> Outcome] = &[
+    route_engine_lifecycle,
+    route_addon_protocol,
+    route_addon_resource,
+    route_resource_plan,
+    route_stream_policy,
+    route_search_plan,
+    route_player_policy,
+    route_watchlist,
+    route_offline,
+    route_content_identity,
+    route_calendar,
+    route_external_sync_trakt,
+    route_external_sync_simkl,
+    route_library_state,
+    route_tmdb,
+    route_intro_segments,
+    route_core_contract,
+];
+
 fn route(method: &str, args_json: &str) -> Outcome {
+    for router in ROUTERS {
+        match router(method, args_json) {
+            Err(CallError { kind: ErrorKind::UnknownMethod, .. }) => continue,
+            result => return result,
+        }
+    }
+    Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`")))
+}
+
+fn route_engine_lifecycle(method: &str, args_json: &str) -> Outcome {
     match method {
-        // Engine lifecycle
         "engine.create" => Ok(json!(headless_engine::create_headless_engine(args_json) as i64)),
         "engine.snapshot" => result_json(
             headless_engine::headless_engine_snapshot_json(handle(args_json)?),
@@ -93,7 +136,12 @@ fn route(method: &str, args_json: &str) -> Outcome {
         }
         "app.destroy" => Ok(json!(app_state::destroy_app_core_state(handle(args_json)?))),
 
-        // Addon protocol — manifest
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_addon_protocol(method: &str, args_json: &str) -> Outcome {
+    match method {
         "identity" => Ok(Value::String(addon_protocol::identity(&arg_str(args_json, "url")?))),
         "normalizeManifestUrl" => Ok(Value::String(addon_protocol::normalize_manifest_url(&arg_str(args_json, "url")?))),
         "manifestFetchPlan" => opt_json(addon_protocol::manifest_fetch_plan_json(&arg_str(args_json, "url")?)),
@@ -161,7 +209,12 @@ fn route(method: &str, args_json: &str) -> Outcome {
             )))
         }
 
-        // Addon resource
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_addon_resource(method: &str, args_json: &str) -> Outcome {
+    match method {
         "parseAddonResourceResult" => {
             let args = object(args_json)?;
             let body = args.get("body").and_then(Value::as_str).map(str::to_string);
@@ -182,6 +235,12 @@ fn route(method: &str, args_json: &str) -> Outcome {
             ))
         }
 
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_resource_plan(method: &str, args_json: &str) -> Outcome {
+    match method {
         // Repository / resource flow — args_json IS the request object
         "addonResourceRequestPlan" => opt_json(repository_flow::addon_resource_request_plan_json(args_json)),
         "resourceFetchPlan" => opt_json(platform_plan::resource_fetch_plan_json(args_json)),
@@ -210,7 +269,13 @@ fn route(method: &str, args_json: &str) -> Outcome {
             ))
         }
 
-        // Stream policy — args_json IS the stream/request JSON
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_stream_policy(method: &str, args_json: &str) -> Outcome {
+    match method {
+        // args_json IS the stream/request JSON
         "streamPlaybackInfo" => opt_json(stream_policy::stream_playback_info_json(args_json)),
         "torrentRuntimeInfo" => opt_json(stream_policy::torrent_runtime_info_json(args_json)),
         "findPreferredSubtitleIndex" => {
@@ -226,7 +291,13 @@ fn route(method: &str, args_json: &str) -> Outcome {
             )))
         }
 
-        // Search / discovery — args_json IS the request object for single-arg methods
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_search_plan(method: &str, args_json: &str) -> Outcome {
+    match method {
+        // args_json IS the request object for single-arg methods
         "searchResultGrouping" => opt_json(search_plan::search_result_grouping_json(args_json)),
         "buildMetadataFeedOptions" => opt_json(search_plan::build_metadata_feed_options_json(args_json)),
         "discoverCatalogOptions" => {
@@ -255,7 +326,13 @@ fn route(method: &str, args_json: &str) -> Outcome {
             ))
         }
 
-        // Player policy — args_json IS the request object for single-arg methods
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_player_policy(method: &str, args_json: &str) -> Outcome {
+    match method {
+        // args_json IS the request object for single-arg methods
         "playerBackendSelection" => opt_json(player_policy::player_backend_selection_json(args_json)),
         "playerBufferTargets" => opt_json(player_policy::player_buffer_targets_json(args_json)),
         "playerRetryPolicy" => opt_json(player_policy::player_retry_policy_json(args_json)),
@@ -276,7 +353,13 @@ fn route(method: &str, args_json: &str) -> Outcome {
             ))
         }
 
-        // Watchlist / library — args_json IS the request object
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_watchlist(method: &str, args_json: &str) -> Outcome {
+    match method {
+        // args_json IS the request object
         "watchlistTogglePlan" => opt_json(watchlist_plan::watchlist_toggle_plan_json(args_json)),
         "playbackProgressMergePlan" => opt_json(watchlist_plan::playback_progress_merge_plan_json(args_json)),
         "libraryApplyMarkWatched" => {
@@ -296,10 +379,21 @@ fn route(method: &str, args_json: &str) -> Outcome {
         "importCollections" => opt_json(watchlist_plan::import_collections_json(args_json)),
         "exportCollections" => opt_json(watchlist_plan::export_collections_json(args_json)),
 
-        // Offline — args_json IS the request object
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_offline(method: &str, args_json: &str) -> Outcome {
+    match method {
+        // args_json IS the request object
         "offlineDownloadPlan" => opt_json(offline_download::offline_download_plan_json(args_json)),
 
-        // Content identity
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_content_identity(method: &str, args_json: &str) -> Outcome {
+    match method {
         "parseVideoId" => into_json(content_identity::parse_video_id_json(&arg_str(args_json, "id")?)),
         "buildTraktIds" => opt_json(content_identity::build_trakt_ids_json(&arg_str(args_json, "id")?)),
         "playbackIntroLookupContentId" => Ok(Value::String(content_identity::playback_intro_lookup_content_id(&arg_str(args_json, "id")?))),
@@ -322,7 +416,12 @@ fn route(method: &str, args_json: &str) -> Outcome {
             ))
         }
 
-        // Calendar
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_calendar(method: &str, args_json: &str) -> Outcome {
+    match method {
         "calendarItemsFromMeta" => {
             let args = object(args_json)?;
             opt_json(calendar_plan::calendar_items_from_meta_json(
@@ -337,8 +436,22 @@ fn route(method: &str, args_json: &str) -> Outcome {
                 field_str(&args, "monthPrefix")?,
             )))
         }
+        "nextUnairedEpisode" => {
+            let args = object(args_json)?;
+            let now_ms = field(&args, "nowMs")?.as_i64()
+                .ok_or_else(|| fail(ErrorKind::InvalidArgs, "nowMs must be a number"))?;
+            opt_json(calendar_plan::next_unaired_episode_json(
+                field_str(&args, "videosJson")?,
+                now_ms,
+            ))
+        }
 
-        // External sync: Trakt
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_external_sync_trakt(method: &str, args_json: &str) -> Outcome {
+    match method {
         // args_json IS the items array for single-array-arg methods
         "traktPlaybackItemsToLibrary" => opt_json(external_sync::trakt_playback_items_to_library_json(args_json)),
         "traktWatchlistToItems" => {
@@ -406,8 +519,15 @@ fn route(method: &str, args_json: &str) -> Outcome {
                 field_str(&args, "itemsJson")?,
             ))
         }
+        "traktPlaybackItemsDedup" => opt_json(external_sync::trakt_playback_items_dedup_json(args_json)),
+        "traktMarkWatchedBody" => opt_json(external_sync::trakt_mark_watched_body_json(args_json)),
 
-        // External sync: Simkl
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_external_sync_simkl(method: &str, args_json: &str) -> Outcome {
+    match method {
         "simklWatchingToItems" => {
             let args = object(args_json)?;
             opt_json(external_sync::simkl_watching_to_items_json(
@@ -449,9 +569,6 @@ fn route(method: &str, args_json: &str) -> Outcome {
                 duration,
             ))
         }
-
-        "traktPlaybackItemsDedup" => opt_json(external_sync::trakt_playback_items_dedup_json(args_json)),
-        "traktMarkWatchedBody" => opt_json(external_sync::trakt_mark_watched_body_json(args_json)),
         "simklMatchEpisode" => {
             let args = object(args_json)?;
             opt_json(external_sync::simkl_match_episode_json(
@@ -460,7 +577,13 @@ fn route(method: &str, args_json: &str) -> Outcome {
             ))
         }
 
-        // Library state — args_json IS the items/item/doc JSON for single-arg methods
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_library_state(method: &str, args_json: &str) -> Outcome {
+    match method {
+        // args_json IS the items/item/doc JSON for single-arg methods
         "libraryContinueWatchingItems" => opt_json(library_state::library_continue_watching_items_json(args_json)),
         "normalizeLibraryDocument" => into_json(library_state::normalize_library_document_json(args_json)),
         "isUpNextContinueWatchingItem" => Ok(json!(library_state::is_up_next_continue_watching_item_json(args_json))),
@@ -510,6 +633,14 @@ fn route(method: &str, args_json: &str) -> Outcome {
                 field(&args, "isHorizontal")?.as_bool().ok_or_else(|| fail(ErrorKind::InvalidArgs, "isHorizontal must be bool"))?,
             )))
         }
+        "continueWatchingCardFields" => {
+            let args = object(args_json)?;
+            opt_json(library_state::continue_watching_card_fields_json(
+                &field(&args, "items")?.to_string(),
+                field_str(&args, "artworkPreference")?,
+                field(&args, "isHorizontal")?.as_bool().ok_or_else(|| fail(ErrorKind::InvalidArgs, "isHorizontal must be bool"))?,
+            ))
+        }
         "buildHomeCollectionShelves" => {
             let args = object(args_json)?;
             opt_json(home_ranking::build_home_collection_shelves_json(
@@ -518,7 +649,12 @@ fn route(method: &str, args_json: &str) -> Outcome {
             ))
         }
 
-        // TMDB
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_tmdb(method: &str, args_json: &str) -> Outcome {
+    match method {
         "tmdbContentType" => Ok(Value::String(tmdb_plan::tmdb_content_type(&arg_str(args_json, "contentType")?).to_string())),
         "tmdbLanguage" => Ok(Value::String(tmdb_plan::tmdb_language(&arg_str(args_json, "language")?))),
         "tmdbImageUrl" => {
@@ -552,7 +688,13 @@ fn route(method: &str, args_json: &str) -> Outcome {
             Ok(json!([content_type, is_movie]))
         }
 
-        // Intro segments — args_json IS the data JSON for single-arg methods
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_intro_segments(method: &str, args_json: &str) -> Outcome {
+    match method {
+        // args_json IS the data JSON for single-arg methods
         "parseIntroDbSegments" => opt_json(intro_segments::parse_intro_db_segments_json(args_json)),
         "parseAniskipResults" => opt_json(intro_segments::parse_aniskip_results_json(args_json)),
         "uniqueIntroSegments" => {
@@ -564,7 +706,12 @@ fn route(method: &str, args_json: &str) -> Outcome {
         }
         "mergeIntroSegments" => opt_json(intro_segments::merge_intro_segments_json(args_json)),
 
-        // Core contract
+        _ => Err(fail(ErrorKind::UnknownMethod, format!("no such method `{method}`"))),
+    }
+}
+
+fn route_core_contract(method: &str, args_json: &str) -> Outcome {
+    match method {
         "coreCapabilities" => into_json(core_contract::core_capabilities_json(
             object(args_json).ok().and_then(|o| o.get("portable").and_then(Value::as_bool)).unwrap_or(false),
         )),

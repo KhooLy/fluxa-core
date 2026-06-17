@@ -148,22 +148,44 @@ impl Blank for String {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+    // Collect into chars (not a String) and decode each digit individually —
+    // slicing a String by byte range assumes 1 char == 1 byte, which a
+    // multi-byte UTF-8 character in malformed input would violate and panic on.
     let clean = value
         .chars()
         .filter(|ch| !ch.is_whitespace() && *ch != ':')
-        .collect::<String>();
+        .collect::<Vec<char>>();
     if clean.len() % 2 != 0 {
         return Err("hex length must be even".to_string());
     }
-    (0..clean.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&clean[index..index + 2], 16)
-                .map_err(|error| error.to_string())
+    clean
+        .chunks(2)
+        .map(|pair| match (pair[0].to_digit(16), pair[1].to_digit(16)) {
+            (Some(hi), Some(lo)) => Ok((hi * 16 + lo) as u8),
+            _ => Err(format!("invalid hex digit in pair: {}{}", pair[0], pair[1])),
         })
         .collect()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_strips_whitespace_and_colons() {
+        assert_eq!(hex_decode("AB:CD EF").unwrap(), vec![0xAB, 0xCD, 0xEF]);
+    }
+
+    #[test]
+    fn hex_decode_rejects_malformed_input_instead_of_panicking() {
+        // A multi-byte UTF-8 character mixed into otherwise-hex-looking input used
+        // to panic (byte-range slicing assumed 1 char == 1 byte); it must now
+        // surface as an error.
+        assert!(hex_decode("aébb").is_err());
+        assert!(hex_decode("abc").is_err(), "odd length must error, not panic");
+    }
 }

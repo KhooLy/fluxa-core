@@ -4,25 +4,25 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PlayerFlowState {
+pub(crate) struct PlayerFlowState {
     #[serde(default)]
-    current_video_id: Option<String>,
+    pub(crate) current_video_id: Option<String>,
     #[serde(default)]
-    current_streams: Vec<Value>,
+    pub(crate) current_streams: Vec<Value>,
     #[serde(default)]
-    current_stream_index: i32,
+    pub(crate) current_stream_index: i32,
     #[serde(default)]
-    current_url: Option<String>,
+    pub(crate) current_url: Option<String>,
     #[serde(default)]
-    zero_speed_ticks: i32,
+    pub(crate) zero_speed_ticks: i32,
     #[serde(default)]
-    is_buffering: bool,
+    pub(crate) is_buffering: bool,
     #[serde(default)]
-    is_video_rendered: bool,
+    pub(crate) is_video_rendered: bool,
     #[serde(default)]
-    player_error: Option<String>,
+    pub(crate) player_error: Option<String>,
     #[serde(default)]
-    preferred_binge_group: Option<String>,
+    pub(crate) preferred_binge_group: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -31,7 +31,7 @@ struct PlayerFlowState {
     rename_all_fields = "camelCase",
     tag = "type"
 )]
-enum PlayerFlowAction {
+pub(crate) enum PlayerFlowAction {
     #[serde(rename = "loadStreamsRequested")]
     LoadStreamsRequested {
         content_type: String,
@@ -69,7 +69,7 @@ struct PlayerFlowResult {
     rename_all_fields = "camelCase",
     tag = "type"
 )]
-enum PlayerFlowEffect {
+pub(crate) enum PlayerFlowEffect {
     #[serde(rename = "loadStreams")]
     LoadStreams {
         content_type: String,
@@ -85,7 +85,7 @@ pub(crate) fn player_flow_dispatch_json(state_json: &str, action_json: &str) -> 
     serde_json::to_string(&PlayerFlowResult { state, effects }).ok()
 }
 
-fn dispatch(state: &mut PlayerFlowState, action: PlayerFlowAction) -> Vec<PlayerFlowEffect> {
+pub(crate) fn dispatch(state: &mut PlayerFlowState, action: PlayerFlowAction) -> Vec<PlayerFlowEffect> {
     match action {
         PlayerFlowAction::LoadStreamsRequested {
             content_type,

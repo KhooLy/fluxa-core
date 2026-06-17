@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 const STREAM_SOURCE_MODE_FIRST: &str = "first";
 const STREAM_SOURCE_MODE_REGEX: &str = "regex";
+const VIDEO_FILE_EXTENSIONS: [&str; 7] = [".mkv", ".mp4", ".avi", ".webm", ".m4v", ".mov", ".ts"];
 
 pub(crate) fn stream_behavior_text<'a>(stream: &'a Value, key: &str) -> Option<&'a str> {
     stream
@@ -54,9 +55,14 @@ pub(crate) fn percent_decode_component(value: &str) -> String {
     let raw = value.as_bytes();
     let mut index = 0;
     while index < raw.len() {
+        // Decode the two hex digits as raw bytes rather than slicing `value` —
+        // a `%` next to a multi-byte UTF-8 character can put the slice bound
+        // mid-character, which panics; byte-at-a-time reads can't.
         if raw[index] == b'%' && index + 2 < raw.len() {
-            if let Ok(hex) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                bytes.push(hex);
+            let hi = (raw[index + 1] as char).to_digit(16);
+            let lo = (raw[index + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                bytes.push((hi * 16 + lo) as u8);
                 index += 3;
                 continue;
             }
@@ -296,7 +302,7 @@ pub(crate) fn normalize_torrent_file_name(value: &str) -> String {
 
 pub(crate) fn is_likely_video_file(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
-    [".mkv", ".mp4", ".avi", ".webm", ".m4v", ".mov", ".ts"]
+    VIDEO_FILE_EXTENSIONS
         .iter()
         .any(|extension| path.ends_with(extension))
 }
@@ -945,5 +951,55 @@ mod tests {
         assert_eq!(state["preferredSubtitleIndex"], -1);
         assert!(state["preferredSubtitleId"].is_null());
         assert_eq!(state["subtitlesDisabled"], true);
+    }
+
+    #[test]
+    fn build_magnet_dedupes_addon_tracker_and_appends_fallbacks() {
+        let magnet = build_magnet(
+            "ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+            &["tracker:udp://tracker.example:1337/announce".to_string()],
+        );
+
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12"));
+        assert_eq!(magnet.matches("tracker.example%3A1337").count(), 1);
+        assert!(magnet.contains("opentrackr.org"));
+    }
+
+    #[test]
+    fn resolve_torrent_file_index_prefers_requested_then_filename_then_largest_video() {
+        let stats = vec![
+            TorrentFileStat { id: 1, path: "Show.S01E01.mkv".to_string(), length: 100 },
+            TorrentFileStat { id: 2, path: "Show.S01E02.mkv".to_string(), length: 300 },
+            TorrentFileStat { id: 3, path: "sample.txt".to_string(), length: 999_999 },
+        ];
+
+        // Addon-provided fileIdx wins outright, even though it doesn't match any stat.
+        assert_eq!(
+            resolve_torrent_file_index("title", Some(9), None, &stats),
+            (Some(9), Some("requested".to_string()))
+        );
+
+        // No requested index, but a preferred filename matches by basename.
+        assert_eq!(
+            resolve_torrent_file_index("title", None, Some("Show.S01E01.mkv"), &stats),
+            (Some(1), Some("filename".to_string()))
+        );
+
+        // No requested index or filename match — falls back to the largest *video* file,
+        // ignoring the much larger non-video sample.txt.
+        assert_eq!(
+            resolve_torrent_file_index("title", None, None, &stats),
+            (Some(2), Some("largest-video".to_string()))
+        );
+
+        assert_eq!(resolve_torrent_file_index("title", None, None, &[]), (None, None));
+    }
+
+    #[test]
+    fn percent_decode_component_decodes_escapes_and_survives_multibyte_input() {
+        assert_eq!(percent_decode_component("Breaking%20Bad"), "Breaking Bad");
+        // A literal '%' immediately before a multi-byte UTF-8 character used to
+        // panic on a mid-character slice bound; it must now just pass through.
+        assert_eq!(percent_decode_component("%xé"), "%xé");
     }
 }

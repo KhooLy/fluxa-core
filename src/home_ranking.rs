@@ -1,7 +1,7 @@
 use crate::content_identity::{imdb_id, normalized_billboard_title};
 use crate::search_plan::resolve_transport_url_json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
 const CORE_SHELF_KEYS: &[&str] = &[
@@ -419,11 +419,30 @@ pub(crate) fn optimize_home_rows_json(request_json: &str) -> Option<String> {
             .filter(|category| is_pinned(category))
             .cloned(),
     );
+    let candidates = sorted_unpinned_candidates(&request);
+    let kept = select_diverse_categories(&candidates);
+    let fallback = fallback_categories(candidates, &kept);
+
+    let mut output = pinned;
+    output.extend(kept);
+    output.extend(fallback);
+    let limit = 24 + output_pinned_count(&output);
+    let output = distinct_categories(output.into_iter())
+        .into_iter()
+        .take(limit)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&output).ok()
+}
+
+// Unpinned categories, curated down to their top items and sorted by the
+// caller's preferred order first, personalization score second.
+fn sorted_unpinned_candidates(request: &HomeOptimizeRequest) -> Vec<NativeHomeCategory> {
     let mut candidates = distinct_categories(
         request
             .categories
-            .into_iter()
-            .filter(|category| !is_pinned(category)),
+            .iter()
+            .filter(|category| !is_pinned(category))
+            .cloned(),
     )
     .into_iter()
     .map(|mut category| {
@@ -461,7 +480,12 @@ pub(crate) fn optimize_home_rows_json(request_json: &str) -> Option<String> {
             ))
         })
     });
+    candidates
+}
 
+// Greedily keep candidates that are either a core genre shelf or don't overlap
+// too much with what's already kept, so the final list isn't redundant.
+fn select_diverse_categories(candidates: &[NativeHomeCategory]) -> Vec<NativeHomeCategory> {
     let mut kept = Vec::<NativeHomeCategory>::new();
     for category in candidates.iter() {
         let overlap = kept
@@ -489,8 +513,16 @@ pub(crate) fn optimize_home_rows_json(request_json: &str) -> Option<String> {
             kept.push(category.clone());
         }
     }
+    kept
+}
 
-    let fallback = candidates
+// Fill remaining slots (up to 24 total) from leftover candidates that still
+// don't overlap too much with anything already kept.
+fn fallback_categories(
+    candidates: Vec<NativeHomeCategory>,
+    kept: &[NativeHomeCategory],
+) -> Vec<NativeHomeCategory> {
+    candidates
         .into_iter()
         .filter(|candidate| {
             kept.iter().all(|existing| existing.id != candidate.id)
@@ -500,16 +532,7 @@ pub(crate) fn optimize_home_rows_json(request_json: &str) -> Option<String> {
                 })
         })
         .take(24usize.saturating_sub(kept.len()))
-        .collect::<Vec<_>>();
-    let mut output = pinned;
-    output.extend(kept);
-    output.extend(fallback);
-    let limit = 24 + output_pinned_count(&output);
-    let output = distinct_categories(output.into_iter())
-        .into_iter()
-        .take(limit)
-        .collect::<Vec<_>>();
-    serde_json::to_string(&output).ok()
+        .collect::<Vec<_>>()
 }
 
 fn output_pinned_count(categories: &[NativeHomeCategory]) -> usize {
@@ -630,8 +653,6 @@ pub(crate) fn billboard_editorial_match_score_json(
     Some(year_boost + rating_boost + rank_boost)
 }
 
-// ── Billboard pool selection ──────────────────────────────────────────────────
-
 fn billboard_key_value(meta: &Value) -> String {
     let id = meta_text(meta, "id");
     if let Some(iid) = imdb_id(id) {
@@ -694,16 +715,6 @@ fn billboard_visual_score(meta: &Value) -> i32 {
     score
 }
 
-/// Selects a billboard pool of up to 10 items from the enriched+raw candidate sets.
-///
-/// `enriched_json` — candidates that have been enriched via IO (backdrop, logo, etc.).
-/// `candidates_json` — the full original candidate list (before enrichment).
-///
-/// Decision logic (what runs here, not on the Kotlin side):
-///   • editorial picks  — up to 3 items with reason == "EDITORIAL_SPOTLIGHT"
-///   • series picks     — up to 8 items of type "series"
-///   • movie picks      — up to 3 items of type "movie"
-///   • combined, deduplicated, filled to 10 from remaining ranked items
 pub(crate) fn build_billboard_pool_json(
     enriched_json: &str,
     candidates_json: &str,
@@ -786,8 +797,6 @@ pub(crate) fn build_billboard_pool_json(
     serde_json::to_string(&final_pool).ok()
 }
 
-// ── Catalog item normalisation ────────────────────────────────────────────────
-
 fn iso_date_part(date_str: &str) -> Option<&str> {
     let s = date_str.trim();
     let date_part = s.get(..10)?;
@@ -805,14 +814,6 @@ fn is_upcoming_date(date_str: &str, today_iso: &str) -> bool {
 
 const RANKED_CATALOG_IDS: &[&str] = &["trending", "popular", "top", "now_playing"];
 
-/// Normalises catalog items on behalf of the Kotlin HomeCatalogItemNormalizer.
-///
-/// Decisions kept here (Rust decides, Kotlin executes):
-///   • Assign `rank = index + 1` for ranking catalogs when no genre filter is active.
-///   • Drop items whose release date is still in the future (upcoming releases).
-///
-/// `genre` being `None` / empty string means no genre filter is active.
-/// `today_iso` must be supplied as "YYYY-MM-DD" by the caller.
 pub(crate) fn normalize_home_catalog_items_json(
     items_json: &str,
     catalog_id: &str,
@@ -883,79 +884,11 @@ pub(crate) fn build_home_collection_shelves_json(profile_json: &str, addons_json
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("col{ci}_f{fi}"));
 
-            let mut resolved: Vec<Value> = Vec::new();
-
-            if let Some(sources) = folder.get("catalogSources").and_then(Value::as_array) {
-                for s in sources {
-                    if s.get("catalogId").and_then(Value::as_str).is_none() {
-                        continue;
-                    }
-                    if let Some(t_url) = resolve_transport_url_json(&s.to_string(), addons_json) {
-                        let catalog_id = s.get("catalogId").and_then(Value::as_str).unwrap_or("");
-                        let content_type = s.get("type").and_then(Value::as_str).unwrap_or("movie");
-                        let mut entry = json!({ "transportUrl": t_url, "catalogId": catalog_id, "type": content_type });
-                        if let Some(g) = folder.get("genre").and_then(Value::as_str) {
-                            entry["genre"] = Value::String(g.to_string());
-                        }
-                        resolved.push(entry);
-                    }
-                }
-            }
-
-            if resolved.is_empty() {
-                if let Some(catalog_id) = folder.get("catalogId").and_then(Value::as_str) {
-                    let src = json!({ "catalogId": catalog_id, "type": "movie" });
-                    if let Some(t_url) = resolve_transport_url_json(&src.to_string(), addons_json) {
-                        let mut entry = json!({ "transportUrl": t_url, "catalogId": catalog_id, "type": "movie" });
-                        if let Some(g) = folder.get("genre").and_then(Value::as_str) {
-                            entry["genre"] = Value::String(g.to_string());
-                        }
-                        resolved.push(entry);
-                    }
-                }
-            }
-
+            let resolved = resolve_folder_catalog_sources(folder, addons_json);
             if !resolved.is_empty() {
-                let mut hcat = json!({
-                    "id": folder_id,
-                    "name": folder_title,
-                    "type": "collection_folder",
-                    "items": [],
-                    "catalogSources": resolved,
-                    "canLoadMore": false,
-                });
-                if let Some(g) = folder.get("genre").and_then(Value::as_str) {
-                    hcat["addonGenre"] = Value::String(g.to_string());
-                }
-                hidden.push(hcat);
+                hidden.push(hidden_folder_category(&folder_id, &folder_title, folder, resolved));
             }
-
-            let img_url = folder.get("coverImageUrl").and_then(Value::as_str)
-                .or_else(|| folder.get("imageUrl").and_then(Value::as_str))
-                .unwrap_or("");
-            let bg_url = folder.get("heroBackdropUrl").and_then(Value::as_str).unwrap_or(img_url);
-            let focus_gif_enabled = folder.get("focusGifEnabled").and_then(Value::as_bool).unwrap_or(true);
-
-            let mut tile = json!({
-                "id": folder_id,
-                "type": "catalog_folder",
-                "name": folder_title,
-                "poster": if img_url.is_empty() { Value::Null } else { Value::String(img_url.to_string()) },
-                "background": if bg_url.is_empty() { Value::Null } else { Value::String(bg_url.to_string()) },
-                "reason": folder.get("shape").and_then(Value::as_str).unwrap_or("poster"),
-            });
-            if let Some(logo) = folder.get("titleLogoUrl").and_then(Value::as_str) {
-                tile["logo"] = Value::String(logo.to_string());
-            }
-            if let Some(info) = folder.get("catalogTitle").and_then(Value::as_str) {
-                tile["releaseInfo"] = Value::String(info.to_string());
-            }
-            if focus_gif_enabled {
-                if let Some(gif) = folder.get("focusGifUrl").and_then(Value::as_str) {
-                    tile["focusGifUrl"] = Value::String(gif.to_string());
-                }
-            }
-            tiles.push(tile);
+            tiles.push(folder_tile(&folder_id, &folder_title, folder));
         }
 
         if tiles.is_empty() {
@@ -985,4 +918,147 @@ pub(crate) fn build_home_collection_shelves_json(profile_json: &str, addons_json
         "regularShelves": regular,
         "hiddenFolderCategories": hidden,
     })).ok()
+}
+
+// A folder's catalog sources, preferring its explicit catalogSources list and
+// falling back to a single source built from its own catalogId.
+fn resolve_folder_catalog_sources(folder: &Map<String, Value>, addons_json: &str) -> Vec<Value> {
+    let mut resolved: Vec<Value> = Vec::new();
+    if let Some(sources) = folder.get("catalogSources").and_then(Value::as_array) {
+        for s in sources {
+            if s.get("catalogId").and_then(Value::as_str).is_none() {
+                continue;
+            }
+            if let Some(t_url) = resolve_transport_url_json(&s.to_string(), addons_json) {
+                let catalog_id = s.get("catalogId").and_then(Value::as_str).unwrap_or("");
+                let content_type = s.get("type").and_then(Value::as_str).unwrap_or("movie");
+                let mut entry = json!({ "transportUrl": t_url, "catalogId": catalog_id, "type": content_type });
+                if let Some(g) = folder.get("genre").and_then(Value::as_str) {
+                    entry["genre"] = Value::String(g.to_string());
+                }
+                resolved.push(entry);
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        if let Some(catalog_id) = folder.get("catalogId").and_then(Value::as_str) {
+            let src = json!({ "catalogId": catalog_id, "type": "movie" });
+            if let Some(t_url) = resolve_transport_url_json(&src.to_string(), addons_json) {
+                let mut entry = json!({ "transportUrl": t_url, "catalogId": catalog_id, "type": "movie" });
+                if let Some(g) = folder.get("genre").and_then(Value::as_str) {
+                    entry["genre"] = Value::String(g.to_string());
+                }
+                resolved.push(entry);
+            }
+        }
+    }
+    resolved
+}
+
+fn hidden_folder_category(
+    folder_id: &str,
+    folder_title: &str,
+    folder: &Map<String, Value>,
+    resolved: Vec<Value>,
+) -> Value {
+    let mut hcat = json!({
+        "id": folder_id,
+        "name": folder_title,
+        "type": "collection_folder",
+        "items": [],
+        "catalogSources": resolved,
+        "canLoadMore": false,
+    });
+    if let Some(g) = folder.get("genre").and_then(Value::as_str) {
+        hcat["addonGenre"] = Value::String(g.to_string());
+    }
+    hcat
+}
+
+fn folder_tile(folder_id: &str, folder_title: &str, folder: &Map<String, Value>) -> Value {
+    let img_url = folder.get("coverImageUrl").and_then(Value::as_str)
+        .or_else(|| folder.get("imageUrl").and_then(Value::as_str))
+        .unwrap_or("");
+    let bg_url = folder.get("heroBackdropUrl").and_then(Value::as_str).unwrap_or(img_url);
+    let focus_gif_enabled = folder.get("focusGifEnabled").and_then(Value::as_bool).unwrap_or(true);
+
+    let mut tile = json!({
+        "id": folder_id,
+        "type": "catalog_folder",
+        "name": folder_title,
+        "poster": if img_url.is_empty() { Value::Null } else { Value::String(img_url.to_string()) },
+        "background": if bg_url.is_empty() { Value::Null } else { Value::String(bg_url.to_string()) },
+        "reason": folder.get("shape").and_then(Value::as_str).unwrap_or("poster"),
+    });
+    if let Some(logo) = folder.get("titleLogoUrl").and_then(Value::as_str) {
+        tile["logo"] = Value::String(logo.to_string());
+    }
+    if let Some(info) = folder.get("catalogTitle").and_then(Value::as_str) {
+        tile["releaseInfo"] = Value::String(info.to_string());
+    }
+    if focus_gif_enabled {
+        if let Some(gif) = folder.get("focusGifUrl").and_then(Value::as_str) {
+            tile["focusGifUrl"] = Value::String(gif.to_string());
+        }
+    }
+    tile
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_collection_shelves_filter_hidden_collections_and_resolve_catalog_sources() {
+        let profile = json!({
+            "libraryCollections": [
+                {
+                    "id": "col1",
+                    "title": "My Collection",
+                    "showOnHome": true,
+                    "pinToTop": true,
+                    "folders": [
+                        {
+                            "id": "f1",
+                            "title": "Action",
+                            "coverImageUrl": "https://img.example/cover.jpg",
+                            "catalogSources": [{ "catalogId": "top", "type": "movie" }],
+                        }
+                    ],
+                },
+                {
+                    "id": "col2",
+                    "title": "Not Shown",
+                    "showOnHome": false,
+                    "folders": [{ "id": "f2", "title": "Hidden", "catalogId": "top" }],
+                },
+            ],
+        });
+        let addons = json!([
+            {
+                "transportUrl": "https://addon.example/manifest.json",
+                "manifest": { "id": "addon.example", "catalogs": [{ "id": "top", "type": "movie" }] },
+            }
+        ]);
+
+        let result = build_home_collection_shelves_json(&profile.to_string(), &addons.to_string())
+            .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+            .expect("shelves");
+
+        assert!(result["regularShelves"].as_array().unwrap().is_empty());
+        let pinned = result["pinnedShelves"].as_array().unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0]["id"], "col1");
+        assert_eq!(pinned[0]["items"][0]["id"], "f1");
+        assert_eq!(pinned[0]["items"][0]["poster"], "https://img.example/cover.jpg");
+
+        let hidden = result["hiddenFolderCategories"].as_array().unwrap();
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0]["id"], "f1");
+        assert_eq!(
+            hidden[0]["catalogSources"][0]["transportUrl"],
+            "https://addon.example/manifest.json"
+        );
+    }
 }

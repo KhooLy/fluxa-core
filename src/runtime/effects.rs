@@ -22,6 +22,7 @@ pub enum EffectKind {
     FetchMetaDetailLookup,
     FetchSeasonEpisodes,
     FetchSubtitles,
+    LoadStreams,
     NotifyReleasedEpisodes,
     PrefetchDetailStreams,
     PrefetchNextEpisodeStreams,
@@ -68,6 +69,7 @@ impl EffectKind {
             EffectKind::FetchMetaDetailLookup => "fetchMetaDetailLookup",
             EffectKind::FetchSeasonEpisodes => "fetchSeasonEpisodes",
             EffectKind::FetchSubtitles => "fetchSubtitles",
+            EffectKind::LoadStreams => "loadStreams",
             EffectKind::NotifyReleasedEpisodes => "notifyReleasedEpisodes",
             EffectKind::PrefetchDetailStreams => "prefetchDetailStreams",
             EffectKind::PrefetchNextEpisodeStreams => "prefetchNextEpisodeStreams",
@@ -97,6 +99,54 @@ impl EffectKind {
             EffectKind::WriteSettings => "writeSettings",
         }
     }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "clearPlaybackProgress" => EffectKind::ClearPlaybackProgress,
+            "enqueueOfflineDownload" => EffectKind::EnqueueOfflineDownload,
+            "enqueueTraktScrobble" => EffectKind::EnqueueTraktScrobble,
+            "exchangeAuthCode" => EffectKind::ExchangeAuthCode,
+            "fetchAddonManifest" => EffectKind::FetchAddonManifest,
+            "fetchAddonResource" => EffectKind::FetchAddonResource,
+            "fetchCatalogPage" => EffectKind::FetchCatalogPage,
+            "fetchDetailSecondary" => EffectKind::FetchDetailSecondary,
+            "fetchDetailStreams" => EffectKind::FetchDetailStreams,
+            "fetchIntroSegments" => EffectKind::FetchIntroSegments,
+            "fetchMetaDetail" => EffectKind::FetchMetaDetail,
+            "fetchMetaDetailLookup" => EffectKind::FetchMetaDetailLookup,
+            "fetchSeasonEpisodes" => EffectKind::FetchSeasonEpisodes,
+            "fetchSubtitles" => EffectKind::FetchSubtitles,
+            "loadStreams" => EffectKind::LoadStreams,
+            "notifyReleasedEpisodes" => EffectKind::NotifyReleasedEpisodes,
+            "prefetchDetailStreams" => EffectKind::PrefetchDetailStreams,
+            "prefetchNextEpisodeStreams" => EffectKind::PrefetchNextEpisodeStreams,
+            "prepareDirectPlayback" => EffectKind::PrepareDirectPlayback,
+            "readCalendarMonth" => EffectKind::ReadCalendarMonth,
+            "readDetailLocalState" => EffectKind::ReadDetailLocalState,
+            "readDiscoverCatalogFilters" => EffectKind::ReadDiscoverCatalogFilters,
+            "readHomeBootstrap" => EffectKind::ReadHomeBootstrap,
+            "readLibraryState" => EffectKind::ReadLibraryState,
+            "readPlaybackProgress" => EffectKind::ReadPlaybackProgress,
+            "refreshAuthToken" => EffectKind::RefreshAuthToken,
+            "refreshInstalledAddons" => EffectKind::RefreshInstalledAddons,
+            "replaceExternalContinueWatching" => EffectKind::ReplaceExternalContinueWatching,
+            "resolveIntroImdbId" => EffectKind::ResolveIntroImdbId,
+            "runAuthFlow" => EffectKind::RunAuthFlow,
+            "runDiscover" => EffectKind::RunDiscover,
+            "runExternalSync" => EffectKind::RunExternalSync,
+            "runSearch" => EffectKind::RunSearch,
+            "startTorrentStream" => EffectKind::StartTorrentStream,
+            "stopTorrent" => EffectKind::StopTorrent,
+            "syncExternalIntegration" => EffectKind::SyncExternalIntegration,
+            "syncWatchedState" => EffectKind::SyncWatchedState,
+            "updateCalendarWidget" => EffectKind::UpdateCalendarWidget,
+            "writeFeedback" => EffectKind::WriteFeedback,
+            "writeLibraryCommand" => EffectKind::WriteLibraryCommand,
+            "writePlaybackProgress" => EffectKind::WritePlaybackProgress,
+            "writeSettings" => EffectKind::WriteSettings,
+            _ => return None,
+        })
+    }
 }
 
 /// Wire format for an effect emitted by the headless engine.
@@ -114,7 +164,7 @@ impl EffectKind {
 /// `id` is a monotonically-increasing opaque string (`"fx-N"`).
 /// `generation` lets the platform discard stale completions.
 /// `payload` carries effect-specific parameters as a JSON object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectEnvelope {
     pub id: String,
@@ -144,83 +194,63 @@ impl EffectEnvelope {
     }
 }
 
-/// Typed effect emitted by a portable engine model for the platform to execute.
-///
-/// Mirrors stremio-core's `Effect` enum.  Each variant carries fully-typed
-/// payload fields, making it compile-time verified and WASM-safe.
-///
-/// The headless engine currently serializes effects through `EffectEnvelope`
-/// (untyped payload).  This typed enum is the long-term migration target for
-/// models that have been fully ported away from `serde_json::Value` state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum Effect {
-    FetchAddonResource {
-        effect_id: String,
-        url: String,
-        timeout_ms: u32,
-    },
-    FetchAddonManifest {
-        effect_id: String,
-        url: String,
-        timeout_ms: u32,
-    },
-    FetchCatalogPage {
-        effect_id: String,
-        url: String,
-    },
-    FetchMetaDetail {
-        effect_id: String,
-        url: String,
-    },
-    FetchStreams {
-        effect_id: String,
-        url: String,
-    },
-    FetchSubtitles {
-        effect_id: String,
-        url: String,
-    },
-    GetStorage {
-        effect_id: String,
-        key: String,
-    },
-    SetStorage {
-        effect_id: String,
-        key: String,
-        value: Option<String>,
-    },
-    Log {
-        message: String,
-    },
-}
+#[cfg(test)]
+mod tests {
+    use super::EffectKind;
 
-#[derive(Debug, Clone, Default)]
-pub struct Effects {
-    pub effects: Vec<Effect>,
-    pub has_changed: bool,
-}
-
-impl Effects {
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    pub fn changed() -> Self {
-        Self {
-            effects: vec![],
-            has_changed: true,
+    #[test]
+    fn as_str_and_from_str_roundtrip_for_every_variant() {
+        let all = [
+            EffectKind::ClearPlaybackProgress,
+            EffectKind::EnqueueOfflineDownload,
+            EffectKind::EnqueueTraktScrobble,
+            EffectKind::ExchangeAuthCode,
+            EffectKind::FetchAddonManifest,
+            EffectKind::FetchAddonResource,
+            EffectKind::FetchCatalogPage,
+            EffectKind::FetchDetailSecondary,
+            EffectKind::FetchDetailStreams,
+            EffectKind::FetchIntroSegments,
+            EffectKind::FetchMetaDetail,
+            EffectKind::FetchMetaDetailLookup,
+            EffectKind::FetchSeasonEpisodes,
+            EffectKind::FetchSubtitles,
+            EffectKind::LoadStreams,
+            EffectKind::NotifyReleasedEpisodes,
+            EffectKind::PrefetchDetailStreams,
+            EffectKind::PrefetchNextEpisodeStreams,
+            EffectKind::PrepareDirectPlayback,
+            EffectKind::ReadCalendarMonth,
+            EffectKind::ReadDetailLocalState,
+            EffectKind::ReadDiscoverCatalogFilters,
+            EffectKind::ReadHomeBootstrap,
+            EffectKind::ReadLibraryState,
+            EffectKind::ReadPlaybackProgress,
+            EffectKind::RefreshAuthToken,
+            EffectKind::RefreshInstalledAddons,
+            EffectKind::ReplaceExternalContinueWatching,
+            EffectKind::ResolveIntroImdbId,
+            EffectKind::RunAuthFlow,
+            EffectKind::RunDiscover,
+            EffectKind::RunExternalSync,
+            EffectKind::RunSearch,
+            EffectKind::StartTorrentStream,
+            EffectKind::StopTorrent,
+            EffectKind::SyncExternalIntegration,
+            EffectKind::SyncWatchedState,
+            EffectKind::UpdateCalendarWidget,
+            EffectKind::WriteFeedback,
+            EffectKind::WriteLibraryCommand,
+            EffectKind::WritePlaybackProgress,
+            EffectKind::WriteSettings,
+        ];
+        for kind in all {
+            assert_eq!(EffectKind::from_str(kind.as_str()), Some(kind));
         }
     }
 
-    pub fn with_effect(mut self, effect: Effect) -> Self {
-        self.effects.push(effect);
-        self
-    }
-
-    pub fn merge(mut self, other: Effects) -> Self {
-        self.effects.extend(other.effects);
-        self.has_changed = self.has_changed || other.has_changed;
-        self
+    #[test]
+    fn from_str_rejects_unknown_value() {
+        assert_eq!(EffectKind::from_str("notAnEffect"), None);
     }
 }

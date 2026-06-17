@@ -186,8 +186,6 @@ pub(crate) fn playback_progress_merge_plan_json(request_json: &str) -> Option<St
     .ok()
 }
 
-// ── Collections import/export ─────────────────────────────────────────────────
-
 fn cleaned_url(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
@@ -228,9 +226,6 @@ fn export_shape(value: Option<&str>) -> &'static str {
     }
 }
 
-/// Parses a raw JSON string (array or single object) of user collections in the
-/// portable cross-platform exchange format and normalises it into the internal
-/// `UserCollection[]` representation used by the desktop/Android apps.
 // FNV-1a over the title: a wasm-safe, deterministic id suffix for imported
 // entries that arrive without one (re-importing the same file is idempotent).
 fn stable_suffix(seed: &str) -> u64 {
@@ -244,10 +239,9 @@ fn stable_suffix(seed: &str) -> u64 {
 
 pub(crate) fn import_collections_json(raw_json: &str) -> Option<String> {
     let parsed: Value = serde_json::from_str(raw_json).ok()?;
-    let arr: Vec<&Value> = if parsed.is_array() {
-        parsed.as_array().unwrap().iter().collect()
-    } else {
-        vec![&parsed]
+    let arr: Vec<&Value> = match parsed.as_array() {
+        Some(a) => a.iter().collect(),
+        None => vec![&parsed],
     };
 
     let collections: Vec<Value> = arr.iter().enumerate().filter_map(|(i, col)| {
@@ -331,7 +325,6 @@ pub(crate) fn import_collections_json(raw_json: &str) -> Option<String> {
     serde_json::to_string(&collections).ok()
 }
 
-/// Serialises the internal `UserCollection[]` into the portable exchange format.
 pub(crate) fn export_collections_json(collections_json: &str) -> Option<String> {
     let collections: Vec<Value> = serde_json::from_str(collections_json).ok()?;
     let data: Vec<Value> = collections.iter().map(|col| {

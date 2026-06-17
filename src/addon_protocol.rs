@@ -475,7 +475,9 @@ pub(crate) fn parse_catalogs(json: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-pub(crate) fn parse_manifest(
+// pub rather than pub(crate): re-exported under fuzz_targets for the `fuzz/`
+// crate (see lib.rs). Not part of the supported public API otherwise.
+pub fn parse_manifest(
     body: &str,
     transport_url: &str,
     unknown_name: &str,
@@ -747,8 +749,11 @@ pub(crate) fn catalog_has_required_extra_except(
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_live_manifest_json, parse_manifest, resolve_manifest_assets_json};
-    use serde_json::Value;
+    use super::{
+        build_resource_url, merge_live_manifest_json, parse_manifest, resolve_manifest_assets_json,
+        supports_resource,
+    };
+    use serde_json::{json, Value};
 
     #[test]
     fn resolve_manifest_assets_normalizes_transport_and_relative_assets() {
@@ -968,5 +973,59 @@ mod tests {
             manifest["behaviorHints"]["configurationRequired"].as_bool(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn build_resource_url_appends_extra_path_segment_and_omits_blank_values() {
+        assert_eq!(
+            build_resource_url("https://addon.example/manifest.json", "stream", "movie", "tt123", None),
+            "https://addon.example/stream/movie/tt123.json"
+        );
+        assert_eq!(
+            build_resource_url(
+                "https://addon.example/manifest.json",
+                "catalog",
+                "movie",
+                "top",
+                Some(r#"{"genre":"action"}"#),
+            ),
+            "https://addon.example/catalog/movie/top/genre=action.json"
+        );
+        // A blank extra value contributes nothing — same shape as no extra at all.
+        assert_eq!(
+            build_resource_url(
+                "https://addon.example/manifest.json",
+                "stream",
+                "movie",
+                "tt123",
+                Some(r#"{"genre":""}"#),
+            ),
+            "https://addon.example/stream/movie/tt123.json"
+        );
+    }
+
+    #[test]
+    fn supports_resource_gates_on_content_type_but_catalog_bypasses_id_prefix() {
+        let manifest = json!({
+            "resources": ["stream"],
+            "types": ["movie"],
+            "idPrefixes": ["tt"],
+        });
+        assert!(supports_resource(&manifest.to_string(), "streams", Some("movie"), Some("tt123")));
+        // Wrong content type for this manifest's declared types.
+        assert!(!supports_resource(&manifest.to_string(), "stream", Some("series"), Some("tt123")));
+
+        let catalog_manifest = json!({
+            "resources": [{ "name": "catalog", "types": ["movie"], "idPrefixes": ["tt"] }],
+        });
+        // catalog resources never gate on id prefix, even though one is declared.
+        assert!(supports_resource(
+            &catalog_manifest.to_string(),
+            "catalog",
+            Some("movie"),
+            Some("does-not-match-prefix")
+        ));
+
+        assert!(!supports_resource("not json", "stream", None, None));
     }
 }

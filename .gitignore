@@ -2,3 +2,5 @@
 CLAUDE.md
 *.pdb
 stremio-addon-api/
+fluxa-streaming-engine/resources/ffmpeg/
+fluxa-streaming-engine/target/

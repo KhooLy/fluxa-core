@@ -261,35 +261,34 @@ fn store() -> &'static Mutex<HashMap<u64, AppCoreState>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// See headless_engine::lock_engines — recovering from poison keeps this store
+// usable after a single caught panic instead of going dark for every handle.
+fn lock_store() -> std::sync::MutexGuard<'static, HashMap<u64, AppCoreState>> {
+    store().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn create_app_core_state(initial_json: &str) -> u64 {
     let state = serde_json::from_str(initial_json).unwrap_or_default();
-    if let Ok(mut states) = store().lock() {
-        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-        states.insert(handle, state);
-        handle
-    } else {
-        0
-    }
+    let mut states = lock_store();
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    states.insert(handle, state);
+    handle
 }
 
 pub fn destroy_app_core_state(handle: u64) -> bool {
-    store()
-        .lock()
-        .map(|mut states| states.remove(&handle).is_some())
-        .unwrap_or(false)
+    lock_store().remove(&handle).is_some()
 }
 
 pub fn app_core_state_json(handle: u64) -> Option<String> {
-    store().lock().ok().and_then(|states| {
-        states
-            .get(&handle)
-            .and_then(|state| serde_json::to_string(state).ok())
-    })
+    let states = lock_store();
+    states
+        .get(&handle)
+        .and_then(|state| serde_json::to_string(state).ok())
 }
 
 pub fn app_core_dispatch_json(handle: u64, action_json: &str) -> Option<String> {
     let action: AppCoreAction = serde_json::from_str(action_json).ok()?;
-    let mut states = store().lock().ok()?;
+    let mut states = lock_store();
     let state = states.get_mut(&handle)?;
     reduce(state, action);
     serde_json::to_string(state).ok()

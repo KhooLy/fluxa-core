@@ -6,10 +6,10 @@
   [![Forks][forks-shield]][forks-url]
   [![Stars][stars-shield]][stars-url]
   [![Issues][issues-shield]][issues-url]
-  [![License][license-shield]][license-url]
+  [![License: GPL v3][license-shield]][license-url]
 
   <p>
-    The platform-agnostic Rust brain behind <a href="https://github.com/KhooLy/Fluxa">Fluxa</a>.<br/>
+    The platform-agnostic Rust core behind <a href="https://github.com/KhooLy/Fluxa">Fluxa</a>, a media-streaming app.<br/>
     State management · Stream policy · Addon protocol · Effect-driven I/O
   </p>
 
@@ -19,118 +19,95 @@
 
 ## What is fluxa-core?
 
-`fluxa-core` is a headless Rust library that contains all of Fluxa's domain logic. It handles content discovery, stream selection, playback state, user profiles, library management, calendar tracking, and external integrations (Trakt, Simkl) — with no platform-specific code inside Rust.
+`fluxa-core` is a headless Rust library holding all of Fluxa's domain logic: content
+discovery, stream selection, playback state, profiles, library, calendar, and external
+sync (Trakt, Simkl). It contains no platform-specific code and never performs I/O itself.
 
-**Rust never calls the network.** Instead, the engine emits typed effects that the host platform (Kotlin on Android, or a native Rust runtime on desktop) executes and reports back. This keeps the same crate portable across Android (JNI), desktop (UniFFI), and future targets (WASM).
+**Rust never calls the network, touches disk, or talks to a player.** Instead, the engine
+takes an action and returns state plus a list of typed *effects* describing what needs to
+happen. The host platform executes those effects and reports results back through
+`completeEffect`. The same Rust codebase runs unmodified on Android, desktop, and
+(via WASM) the web — each platform supplies a thin shell that drives the loop.
 
----
+```
+Host  →  dispatch(action_json)
+      ←  { state, effects: [{ id, type, payload }] }
+Host  →  executes each effect (HTTP / storage / player / ...)
+      →  completeEffect({ effectId, result })
+      ←  { state, effects: [...] }
+```
+
+This repo also contains a companion crate, **`fluxa-streaming-engine/`**, which handles
+the runtime streaming side: torrent download (via `librqbit`), local HTTP proxying, and
+Dolby Vision / HDR10+ stream rewriting.
+
+## Who uses this
+
+| Platform | Repo | How it links |
+|---|---|---|
+| Android (mobile + TV) | [Fluxa](https://github.com/KhooLy/Fluxa) | JNI (primary, ~157 functions) + a small UniFFI surface |
+| Desktop (Linux/macOS/Windows) | [FluxaDesktop](https://github.com/KhooLy/FluxaDesktop) | Plain Rust dependency — calls `FluxaCore`/`core_invoke` directly, no FFI marshaling |
+| iOS / tvOS | not in this workspace | UniFFI (`bindings/uniffi.rs`) |
+| webOS | not in this workspace | WASM (`bindings/wasm.rs`, `wasm` feature) |
+
+See [`docs/integrating.md`](docs/integrating.md) for how each platform actually wires
+this crate in, including how to add a new capability for a given platform.
 
 ## Architecture
 
-### The Effect Loop
+- **`headless_engine/`** — the primary state machine. State is a typed `EngineState`
+  struct made of per-feature sub-structs (home, detail, player, library, search, ...);
+  cross-module writes go through `pub(super)` setters, never raw field access.
+- **`app_state.rs`** — a second, simpler engine for overlapping concerns, used by
+  Android via UniFFI. The split is intentional, not duplication to be cleaned up.
+- Three uncoordinated exposure mechanisms, one per platform's needs: `core_api::FluxaCore`
+  (minimal, desktop-only), `ffi::core_invoke` (string-routed dispatcher, desktop + Swift),
+  and `bindings/jni.rs` (Android, no equivalent elsewhere).
 
-```
-Host (Kotlin / native)  →  dispatch(action_json)
-                        ←  { state, effects: [{ id, type, payload }] }
-Host                    →  executes each effect (HTTP / storage / player / ...)
-                        →  completeEffect({ effectId, result })
-                        ←  { state, effects: [...] }
-```
+Full architecture notes, the effect catalog, and the wire-format reference live in
+[`docs/`](docs/):
 
-The host owns all I/O. The Rust engine owns all decisions.
-
-### Binding Layers
-
-```
-┌─────────────────────────────────────────────┐
-│              fluxa-core (Rust)              │
-│                                             │
-│  headless_engine  ←  domain modules         │
-│         ↓                                   │
-│   ┌─────────────┬──────────────┐            │
-│   │  JNI (jni)  │ UniFFI       │            │
-│   │  Android    │ Desktop/WASM │            │
-│   └─────────────┴──────────────┘            │
-└─────────────────────────────────────────────┘
-```
-
-JNI bindings are compiled under the `native` feature (default). UniFFI bindings are always compiled and are the long-term cross-platform target.
-
----
-
-## What's Inside
-
-| Module | Responsibility |
-|--------|----------------|
-| `headless_engine` | Central state machine — dispatches actions, owns pending effects |
-| `addon_protocol` | Manifest URL normalisation, resource URL construction, manifest merging |
-| `stream_policy` | Stream selection, magnet building, audio/subtitle preference matching |
-| `player_policy` | Backend selection (ExoPlayer / MPV / external), track state |
-| `player_flow` | Playback state machine (load → select → play → scrobble) |
-| `content_identity` | ID parsing and normalisation (IMDB, TMDB, Kitsu, episode locators) |
-| `home_ranking` | Billboard and shelf ordering, continue-watching deduplication |
-| `library_state` | Continue-watching badge computation, next-episode resolution |
-| `profile_contract` | Profile activation, auth token merging, settings migration |
-| `profile_prefs` | Typed read of user preferences from raw profile JSON |
-| `search_plan` | Search query planning, result grouping, discover sort |
-| `calendar_plan` | Calendar item filtering, widget rows, release notifications |
-| `external_sync` | Trakt and Simkl API response parsing and history mapping |
-| `addon_store` | Addon search policy, CloudStream repo URL normalisation |
-| `addon_resource` | Addon HTTP response classification (success / empty / error) |
-| `intro_segments` | introdb.app and AniSkip segment parsing, deduplication |
-| `dolby_vision_rpu` | Dolby Vision RPU metadata extraction for HDR stream selection |
-| `platform_plan` | Season/episode navigation planning for the detail screen |
-| `tmdb_plan` | TMDB ID resolution hints, trailer mapping |
-| `discovery_plan` | Discover catalog request planning |
-| `watchlist_plan` | Watchlist toggle, offline grouping, progress merging |
-
----
+- [`docs/overview.md`](docs/overview.md) — architecture, state engines, module map
+- [`docs/effect-loop.md`](docs/effect-loop.md) — the dispatch/effect/completeEffect cycle
+- [`docs/effects.md`](docs/effects.md) — every `EffectKind` and its payload shape
+- [`docs/integrating.md`](docs/integrating.md) — per-platform integration guide
+- [`docs/building.md`](docs/building.md) — features, commands, cross-compilation
 
 ## Building
 
-### Prerequisites
+```bash
+cargo build                  # default (native) features — what Android uses
+cargo test --lib             # ~190 tests, fast
+cargo check --no-default-features --features wasm   # sanity-check the webOS/WASM path
+```
 
-- Rust toolchain (stable) — install via [rustup](https://rustup.rs/)
-- For Android targets, the NDK and cross-compilation targets:
+Android cross-compilation needs the NDK targets:
 
 ```bash
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 ```
 
-### Library
+The companion streaming crate builds independently:
 
 ```bash
-cargo build --release
+cd fluxa-streaming-engine && cargo build
 ```
 
-### Tests
+See [`docs/building.md`](docs/building.md) for the full feature matrix, UniFFI binding
+generation, and release-build details.
 
-```bash
-cargo test
+## Repo layout
+
+```
+src/                    domain logic, headless_engine, FFI bindings
+fluxa-streaming-engine/ torrent + Dolby Vision/HDR10+ stream rewriting (separate crate)
+fuzz/                   cargo-fuzz targets for parsers (episode matching, manifests, percent-decode)
+docs/                   architecture, effects reference, integration guide
 ```
 
-### Android (via Fluxa)
+## License
 
-The Android app builds this crate as part of its Gradle build. See the [Fluxa](https://github.com/KhooLy/Fluxa) repo for the full build setup.
-
-### UniFFI bindings (desktop)
-
-```bash
-cargo build --release --features uniffi-cli
-cargo run --features uniffi-cli --bin uniffi-bindgen generate \
-  --library target/release/libfluxa_core.so \
-  --language kotlin \
-  --out-dir bindings/
-```
-
----
-
-## Used By
-
-- [Fluxa](https://github.com/KhooLy/Fluxa) — Android media hub (Kotlin + Jetpack Compose)
-- [FluxaDesktop](https://github.com/KhooLy/FluxaDesktop) — Desktop media hub (Rust + Tauri)
-
----
+GPL-3.0 — see [LICENSE](LICENSE).
 
 <!-- MARKDOWN LINKS -->
 [contributors-shield]: https://img.shields.io/github/contributors/KhooLy/fluxa-core.svg?style=for-the-badge

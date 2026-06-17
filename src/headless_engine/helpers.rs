@@ -1,22 +1,6 @@
+use super::state::EngineState;
+use crate::constants::GUEST_PROFILE_ID;
 use serde_json::{json, Value};
-
-pub(super) fn current_generation(state: &Value, key: &str) -> u64 {
-    state["_runtime"][key].as_u64().unwrap_or(0)
-}
-
-pub(super) fn pending_effect(state: &Value, effect_id: &str) -> Option<Value> {
-    state["pendingEffects"]
-        .as_array()?
-        .iter()
-        .find(|effect| effect["id"].as_str() == Some(effect_id))
-        .cloned()
-}
-
-pub(super) fn remove_pending_effect(state: &mut Value, effect_id: &str) {
-    if let Some(effects) = state["pendingEffects"].as_array_mut() {
-        effects.retain(|effect| effect["id"].as_str() != Some(effect_id));
-    }
-}
 
 pub(super) fn normalize_error(error: Value) -> Value {
     if error.is_null() {
@@ -34,12 +18,12 @@ pub(super) fn error_code(error: &Value) -> String {
         .to_string()
 }
 
-pub(super) fn active_profile_id(state: &Value, profile: &Value) -> String {
+pub(super) fn active_profile_id(state: &EngineState, profile: &Value) -> String {
     profile["id"]
         .as_str()
-        .or_else(|| state["profile"]["activeProfileId"].as_str())
+        .or_else(|| state.profile.active_profile_id.as_str())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("guest")
+        .unwrap_or(GUEST_PROFILE_ID)
         .to_string()
 }
 
@@ -157,16 +141,5 @@ pub(super) fn upsert_by_key(target: &mut Value, key: &str, value: &str, item: Va
         *existing = item;
     } else {
         items.push(item);
-    }
-}
-
-pub(super) fn merge_object(target: &mut Value, patch: Value) {
-    match (target.as_object_mut(), patch) {
-        (Some(target), Value::Object(patch)) => {
-            for (key, value) in patch {
-                target.insert(key, value);
-            }
-        }
-        _ => {}
     }
 }

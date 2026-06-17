@@ -21,6 +21,7 @@ native = [
 uniffi-bindings = ["dep:uniffi"]
 uniffi-cli = ["uniffi-bindings", "uniffi/cli"]
 wasm = ["dep:wasm-bindgen", "chrono/wasmbind"]
+fuzzing = []
 
 [dependencies]
 base64 = "0.22"
@@ -32,10 +33,18 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uniffi = { version = "0.31.1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+# std::time::Instant panics on wasm32-unknown-unknown (no OS clock without JS
+# interop) — web-time is a drop-in replacement: std re-export on every other
+# target, performance.now() under the hood on wasm.
+web-time = "1"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = "debuginfo"
-panic = "abort"
+# Must stay "unwind" — bindings/jni.rs and ffi.rs::core_invoke catch_unwind at
+# the FFI boundary so a panic in business logic becomes a safe error/null
+# return instead of aborting the whole host process. "abort" would silently
+# defeat that (and UniFFI's own built-in panic-to-exception handling too).
+panic = "unwind"

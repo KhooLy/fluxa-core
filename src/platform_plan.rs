@@ -686,3 +686,96 @@ pub(crate) fn wrap_addon_resource_response(resource: &str, payload_json: &str) -
     };
     serde_json::to_string(&wrapped).unwrap_or_else(|_| "{}".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_episode_plan_picks_selected_episode_season_over_default() {
+        let request = json!({
+            "episodes": [
+                { "id": "tt1:1:1", "season": 1 },
+                { "id": "tt1:1:2", "season": 1 },
+                { "id": "tt1:9:1", "season": 9 },
+            ],
+            "selectedEpisodeId": "tt1:9:1",
+            "metaId": "tt1",
+        });
+        let plan = detail_episode_plan_json(&request.to_string())
+            .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+            .expect("plan");
+
+        assert_eq!(plan["seasonNumbers"], json!([1, 9]));
+        assert_eq!(plan["selectedSeason"], 9);
+        assert_eq!(plan["episodes"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["selectedEpisode"]["id"], "tt1:9:1");
+        assert_eq!(plan["streamRequestId"], "tt1:9:1");
+    }
+
+    #[test]
+    fn detail_episode_plan_falls_back_to_first_season_and_meta_id() {
+        let request = json!({
+            "episodes": [
+                { "id": "tt1:2:1", "season": 2 },
+                { "id": "tt1:3:1", "season": 3 },
+            ],
+            "metaId": "tt1",
+        });
+        let plan = detail_episode_plan_json(&request.to_string())
+            .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+            .expect("plan");
+
+        assert_eq!(plan["selectedSeason"], 2);
+        assert_eq!(plan["selectedEpisode"]["id"], "tt1:2:1");
+        // No selectedEpisodeId in the request, so streamRequestId falls back to the
+        // first episode of the default season, not metaId.
+        assert_eq!(plan["streamRequestId"], "tt1:2:1");
+    }
+
+    #[test]
+    fn resource_fetch_plan_builds_catalog_page_url_with_genre_extra() {
+        let request = json!({
+            "kind": "catalogPage",
+            "transportUrl": "https://addon.example/manifest.json",
+            "contentType": "movie",
+            "catalogId": "top",
+            "genre": "action",
+        });
+        let plan = resource_fetch_plan_json(&request.to_string())
+            .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+            .expect("plan");
+        let requests = plan["requests"].as_array().unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["kind"], "catalogPage");
+        assert!(requests[0]["url"].as_str().unwrap().contains("genre=action"));
+    }
+
+    #[test]
+    fn resource_fetch_plan_search_only_targets_catalogs_supporting_search() {
+        let request = json!({
+            "kind": "search",
+            "query": "batman",
+            "addons": [{
+                "transportUrl": "https://addon.example/manifest.json",
+                "name": "Addon One",
+                "manifest": {
+                    "catalogs": [
+                        { "id": "top", "type": "movie", "name": "Top Movies", "extraSupported": ["search"] },
+                        { "id": "noSearch", "type": "movie", "name": "No Search" },
+                    ],
+                },
+            }],
+        });
+        let plan = resource_fetch_plan_json(&request.to_string())
+            .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+            .expect("plan");
+        let requests = plan["requests"].as_array().unwrap();
+
+        assert_eq!(requests.len(), 1, "catalog without search support must be excluded");
+        assert_eq!(requests[0]["catalogId"], "top");
+        assert_eq!(requests[0]["categoryName"], "Addon One - Top Movies");
+        assert!(requests[0]["url"].as_str().unwrap().contains("search=batman"));
+    }
+}

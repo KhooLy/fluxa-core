@@ -1,3 +1,4 @@
+use super::state::EngineState;
 use crate::runtime::EffectEnvelope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -321,6 +322,71 @@ pub(crate) struct EffectResultInput {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DispatchResult {
-    pub state: Value,
+    pub state: StatePatch,
     pub effects: Vec<EffectEnvelope>,
+}
+
+// Only domains that actually changed since the snapshot taken before this dispatch
+// are `Some` here — the platform merges this onto its existing state instead of
+// replacing it wholesale, since serializing the full EngineState on every action
+// scales with everything the user has ever loaded, not with what changed.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct StatePatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigation: Option<super::navigation::NavigationState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home: Option<super::home::HomeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<super::search::SearchState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discover: Option<super::discover::DiscoverState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<super::detail::DetailState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player: Option<super::player::PlayerState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library: Option<super::library::LibraryState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<super::profile::ProfileState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<super::settings::SettingsState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<super::calendar::CalendarState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addons: Option<super::addons::AddonsState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<super::auth::AuthState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<super::sync::SyncState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<super::detail::LookupState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<super::offline::OfflineState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_effects: Option<Vec<EffectEnvelope>>,
+}
+
+impl StatePatch {
+    pub(super) fn diff(before: &EngineState, after: &EngineState) -> Self {
+        Self {
+            navigation: (before.navigation != after.navigation).then(|| after.navigation.clone()),
+            home: (before.home != after.home).then(|| after.home.clone()),
+            search: (before.search != after.search).then(|| after.search.clone()),
+            discover: (before.discover != after.discover).then(|| after.discover.clone()),
+            detail: (before.detail != after.detail).then(|| after.detail.clone()),
+            player: (before.player != after.player).then(|| after.player.clone()),
+            library: (before.library != after.library).then(|| after.library.clone()),
+            profile: (before.profile != after.profile).then(|| after.profile.clone()),
+            settings: (before.settings != after.settings).then(|| after.settings.clone()),
+            calendar: (before.calendar != after.calendar).then(|| after.calendar.clone()),
+            addons: (before.addons != after.addons).then(|| after.addons.clone()),
+            auth: (before.auth != after.auth).then(|| after.auth.clone()),
+            sync: (before.sync != after.sync).then(|| after.sync.clone()),
+            lookup: (before.lookup != after.lookup).then(|| after.lookup.clone()),
+            offline: (before.offline != after.offline).then(|| after.offline.clone()),
+            pending_effects: (before.pending_effects != after.pending_effects)
+                .then(|| after.pending_effects.clone()),
+        }
+    }
 }

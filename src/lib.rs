@@ -6,6 +6,7 @@ mod addon_resource;
 mod addon_store;
 mod app_state;
 mod calendar_plan;
+mod constants;
 mod content_identity;
 pub mod core_api;
 pub mod core_contract;
@@ -32,7 +33,6 @@ mod stream_policy;
 mod tmdb_plan;
 mod watchlist_plan;
 
-pub mod addon_transport;
 pub mod env;
 pub mod ffi;
 pub mod runtime;
@@ -41,6 +41,19 @@ pub mod types;
 pub mod bindings;
 
 pub use core_api::FluxaCore;
+
+// Re-exports internal parsing functions for the `fuzz/` crate only. These stay
+// pub(crate) for real consumers — this exists purely so libFuzzer can call
+// straight into them without going through ffi::core_invoke's catch_unwind,
+// which would otherwise swallow the exact panics fuzzing is trying to find.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_targets {
+    pub use crate::addon_protocol::parse_manifest;
+    pub use crate::content_identity::{
+        contains_compact_episode, contains_spaced_episode, parse_episode_locator,
+        percent_decode_component,
+    };
+}
 
 #[cfg(test)]
 mod tests {

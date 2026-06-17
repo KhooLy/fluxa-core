@@ -2,7 +2,11 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-pub(crate) fn parse_episode_locator(raw: &str) -> Option<(String, i32, i32)> {
+const TMDB_ID_PREFIX: &str = "tmdb:";
+
+// pub rather than pub(crate): re-exported under fuzz_targets for the `fuzz/`
+// crate (see lib.rs). Not part of the supported public API otherwise.
+pub fn parse_episode_locator(raw: &str) -> Option<(String, i32, i32)> {
     let parts = raw
         .split(':')
         .filter(|part| !part.is_empty())
@@ -16,8 +20,31 @@ pub(crate) fn parse_episode_locator(raw: &str) -> Option<(String, i32, i32)> {
         }
     }
 
-    let lower = raw.to_ascii_lowercase();
+    if let Some((season, episode, _)) = scan_compact_episode_codes(raw).into_iter().next() {
+        return Some((String::new(), season, episode));
+    }
+
+    let parts = raw
+        .split([':', '/', '-', '_'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() >= 3 {
+        let season = parts[parts.len() - 2].parse::<i32>().ok()?;
+        let episode = parts[parts.len() - 1].parse::<i32>().ok()?;
+        return Some((parts[..parts.len() - 2].join(":"), season, episode));
+    }
+    None
+}
+
+// Scans `text` for every SxxExx-style code (case-insensitive), yielding each
+// match's season, episode, and whether a digit immediately follows the parsed
+// episode number — callers that match against a specific target use that to
+// reject a longer digit run than what they're looking for (e.g. "S01E100"
+// shouldn't count as a match for episode 10).
+fn scan_compact_episode_codes(text: &str) -> Vec<(i32, i32, bool)> {
+    let lower = text.to_ascii_lowercase();
     let bytes = lower.as_bytes();
+    let mut matches = Vec::new();
     for index in 0..bytes.len() {
         if bytes[index] != b's' {
             continue;
@@ -40,21 +67,12 @@ pub(crate) fn parse_episode_locator(raw: &str) -> Option<(String, i32, i32)> {
         }
         let season = lower[season_start..episode_start - 1].parse::<i32>().ok();
         let episode = lower[episode_start..cursor].parse::<i32>().ok();
+        let next_is_digit = cursor < bytes.len() && bytes[cursor].is_ascii_digit();
         if let (Some(season), Some(episode)) = (season, episode) {
-            return Some((String::new(), season, episode));
+            matches.push((season, episode, next_is_digit));
         }
     }
-
-    let parts = raw
-        .split([':', '/', '-', '_'])
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if parts.len() >= 3 {
-        let season = parts[parts.len() - 2].parse::<i32>().ok()?;
-        let episode = parts[parts.len() - 1].parse::<i32>().ok()?;
-        return Some((parts[..parts.len() - 2].join(":"), season, episode));
-    }
-    None
+    matches
 }
 
 pub(crate) fn imdb_id(raw: &str) -> Option<String> {
@@ -81,7 +99,7 @@ pub(crate) fn normalize_series_lookup_id(raw_id: &str) -> String {
 
 pub(crate) fn is_tmdb_like_content_id(id: &str) -> bool {
     let base = base_content_id(id);
-    base.to_ascii_lowercase().starts_with("tmdb:") || base.parse::<i32>().is_ok()
+    base.to_ascii_lowercase().starts_with(TMDB_ID_PREFIX) || base.parse::<i32>().is_ok()
 }
 
 pub(crate) fn episode_id(base_id: &str, season: i32, episode: i32) -> String {
@@ -150,7 +168,7 @@ pub(crate) fn playback_intro_lookup_content_id(id: &str) -> String {
     if let Some(imdb) = imdb_id(id) {
         return imdb;
     }
-    base_content_id(id).trim_start_matches("tmdb:").to_string()
+    base_content_id(id).trim_start_matches(TMDB_ID_PREFIX).to_string()
 }
 
 pub(crate) fn playback_stream_request_ids_json(
@@ -403,14 +421,21 @@ fn number_field(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
 }
 
-pub(crate) fn percent_decode_component(value: &str) -> String {
+// pub rather than pub(crate): re-exported under fuzz_targets for the `fuzz/`
+// crate (see lib.rs). Not part of the supported public API otherwise.
+pub fn percent_decode_component(value: &str) -> String {
     let mut bytes = Vec::with_capacity(value.len());
     let raw = value.as_bytes();
     let mut index = 0;
     while index < raw.len() {
+        // Decode the two hex digits as raw bytes rather than slicing `value` —
+        // a `%` next to a multi-byte UTF-8 character can put the slice bound
+        // mid-character, which panics; byte-at-a-time reads can't.
         if raw[index] == b'%' && index + 2 < raw.len() {
-            if let Ok(hex) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                bytes.push(hex);
+            let hi = (raw[index + 1] as char).to_digit(16);
+            let lo = (raw[index + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                bytes.push((hi * 16 + lo) as u8);
                 index += 3;
                 continue;
             }
@@ -846,43 +871,23 @@ pub(crate) fn parse_extra_args_json(extra: &str) -> Option<String> {
     serde_json::to_string(&Value::Object(map)).ok()
 }
 
-pub(crate) fn contains_compact_episode(text: &str, season: i32, episode: i32) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    for index in 0..bytes.len() {
-        if bytes[index] != b's' {
-            continue;
-        }
-        let mut cursor = index + 1;
-        let season_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-            cursor += 1;
-        }
-        if season_start == cursor || cursor >= bytes.len() || bytes[cursor] != b'e' {
-            continue;
-        }
-        let episode_start = cursor + 1;
-        cursor = episode_start;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-            cursor += 1;
-        }
-        if episode_start == cursor {
-            continue;
-        }
-        let parsed_season = lower[season_start..episode_start - 1].parse::<i32>().ok();
-        let parsed_episode = lower[episode_start..cursor].parse::<i32>().ok();
-        let next_is_digit = cursor < bytes.len() && bytes[cursor].is_ascii_digit();
-        if parsed_season == Some(season) && parsed_episode == Some(episode) && !next_is_digit {
-            return true;
-        }
-    }
-    false
+// pub rather than pub(crate): re-exported under fuzz_targets for the `fuzz/`
+// crate (see lib.rs). Not part of the supported public API otherwise.
+pub fn contains_compact_episode(text: &str, season: i32, episode: i32) -> bool {
+    scan_compact_episode_codes(text)
+        .into_iter()
+        .any(|(s, e, next_is_digit)| s == season && e == episode && !next_is_digit)
 }
 
-pub(crate) fn contains_spaced_episode(text: &str, season: i32, episode: i32) -> bool {
+// pub rather than pub(crate): re-exported under fuzz_targets for the `fuzz/`
+// crate (see lib.rs). Not part of the supported public API otherwise.
+pub fn contains_spaced_episode(text: &str, season: i32, episode: i32) -> bool {
     let lower = text.to_ascii_lowercase();
     let mut offset = 0;
-    while let Some(season_index) = lower[offset..].find("season") {
+    // `offset` can land exactly at lower.len() after a non-matching episode at the
+    // very end of the string — .get() (rather than direct indexing) keeps that a
+    // clean "nothing left to search" instead of a panic.
+    while let Some(season_index) = lower.get(offset..).and_then(|rest| rest.find("season")) {
         let mut cursor = offset + season_index + "season".len();
         while lower
             .as_bytes()
@@ -1028,8 +1033,8 @@ pub(crate) fn trakt_identity_key(meta: &Value) -> String {
     if let Some(value) = imdb_regex().find(id).map(|matched| matched.as_str()) {
         return value.to_string();
     }
-    let tmdb = if id.to_ascii_lowercase().starts_with("tmdb:") {
-        id.strip_prefix("tmdb:").unwrap_or(id)
+    let tmdb = if id.to_ascii_lowercase().starts_with(TMDB_ID_PREFIX) {
+        id.strip_prefix(TMDB_ID_PREFIX).unwrap_or(id)
     } else {
         ""
     };
@@ -1368,5 +1373,48 @@ mod tests {
                 .and_then(Value::as_str),
             Some("tt1:1:2")
         );
+    }
+
+    #[test]
+    fn parse_episode_locator_finds_compact_code_with_no_colon_separators() {
+        assert_eq!(
+            parse_episode_locator("Show.Name.S01E02.1080p"),
+            Some((String::new(), 1, 2))
+        );
+    }
+
+    #[test]
+    fn contains_compact_episode_rejects_longer_digit_run_than_target() {
+        // "S01E100" must not match a search for episode 10 — the digit run
+        // continues past what was parsed for the target.
+        assert!(!contains_compact_episode("Show.S01E100.mkv", 1, 10));
+        assert!(contains_compact_episode("Show.S01E100.mkv", 1, 100));
+        assert!(contains_compact_episode("Show.S01E02.mkv", 1, 2));
+    }
+
+    #[test]
+    fn contains_spaced_episode_matches_word_form_and_skips_wrong_season_occurrence() {
+        assert!(contains_spaced_episode("Show Name Season 1 Episode 2 1080p", 1, 2));
+        // First "Season 2" occurrence doesn't match the target season (1), so the
+        // scan must continue past it to the second "Season ... Episode ..." pair.
+        assert!(contains_spaced_episode(
+            "Season 2 Episode 1 and Season 1 Episode 2",
+            1,
+            2
+        ));
+        // "Episode 10" must not match a search for episode 1 — same digit-run guard
+        // as the compact S01E01 form.
+        assert!(!contains_spaced_episode("Season 1 Episode 10", 1, 1));
+        assert!(contains_spaced_episode("Season 1 Episode 10", 1, 10));
+        // A season number that matches but with no "Episode" anywhere after it.
+        assert!(!contains_spaced_episode("Season 1 has no further structure", 1, 2));
+    }
+
+    #[test]
+    fn percent_decode_component_decodes_escapes_and_survives_multibyte_input() {
+        assert_eq!(percent_decode_component("a%2Bb"), "a+b");
+        // Same fix as the duplicate copy in stream_policy.rs — a '%' next to a
+        // multi-byte UTF-8 character used to panic on a mid-character slice.
+        assert_eq!(percent_decode_component("%xé"), "%xé");
     }
 }

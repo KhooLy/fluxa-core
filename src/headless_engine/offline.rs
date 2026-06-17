@@ -1,7 +1,29 @@
-use super::helpers::{current_generation, normalize_error};
+use super::helpers::normalize_error;
+use super::state::GenerationKey;
 use super::{EffectResultInput, HeadlessEngine};
 use crate::runtime::{EffectEnvelope, EffectKind};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(super) struct OfflineState {
+    last_request: Value,
+    last_enqueued: Value,
+    error: Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnqueueOfflineDownloadPayload {
+    meta: Value,
+    stream: Value,
+    video_id: Option<String>,
+    video: Option<Value>,
+    subtitle: Option<Value>,
+    profile_id: Option<String>,
+    language: Option<String>,
+}
 
 pub(super) fn dispatch(
     engine: &mut HeadlessEngine,
@@ -13,26 +35,27 @@ pub(super) fn dispatch(
     profile_id: Option<String>,
     language: Option<String>,
 ) -> Vec<EffectEnvelope> {
-    let generation = engine.bump_generation("offlineGeneration");
-    engine.state["offline"]["lastRequest"] = json!({
-        "meta": meta,
-        "stream": stream,
-        "videoId": video_id,
-        "video": video,
-        "subtitle": subtitle,
-        "profileId": profile_id,
-        "language": language
-    });
-    vec![engine.effect(EffectKind::EnqueueOfflineDownload, generation, engine.state["offline"]["lastRequest"].clone())]
+    let generation = engine.bump_generation(GenerationKey::Offline);
+    let payload = EnqueueOfflineDownloadPayload {
+        meta,
+        stream,
+        video_id,
+        video,
+        subtitle,
+        profile_id,
+        language,
+    };
+    engine.state.offline.last_request = serde_json::to_value(&payload).unwrap_or(Value::Null);
+    vec![engine.effect(EffectKind::EnqueueOfflineDownload, generation, payload)]
 }
 
 pub(super) fn complete(engine: &mut HeadlessEngine, generation: u64, result: &EffectResultInput) -> Vec<EffectEnvelope> {
-    if generation == current_generation(&engine.state, "offlineGeneration") {
+    if generation == engine.state.runtime.get(GenerationKey::Offline) {
         if result.status == "ok" {
-            engine.state["offline"]["lastEnqueued"] = result.value.clone();
-            engine.state["offline"]["error"] = Value::Null;
+            engine.state.offline.last_enqueued = result.value.clone();
+            engine.state.offline.error = Value::Null;
         } else {
-            engine.state["offline"]["error"] = normalize_error(result.error.clone());
+            engine.state.offline.error = normalize_error(result.error.clone());
         }
     }
     vec![]

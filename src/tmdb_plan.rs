@@ -1,3 +1,4 @@
+use crate::constants::DEFAULT_LANGUAGE;
 use serde_json::{json, Value};
 
 pub(crate) fn tmdb_content_type(content_type: &str) -> &str {
@@ -6,7 +7,7 @@ pub(crate) fn tmdb_content_type(content_type: &str) -> &str {
 
 pub(crate) fn tmdb_language(language: &str) -> String {
     match language {
-        "" | "en" => "en-US".to_string(),
+        "" | DEFAULT_LANGUAGE => "en-US".to_string(),
         "tr" => "tr-TR".to_string(),
         lang if lang.contains('-') => lang.to_string(),
         lang => format!("{}-{}", lang, lang.to_uppercase()),

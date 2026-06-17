@@ -30,14 +30,19 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     headers_json: JString<'_>,
     preferred_port: JInt,
 ) -> JStringReturn {
-    let output = read_jstring(&mut env, &target_url).and_then(|target_url| {
-        start_local_stream_server(
-            &target_url,
-            &read_jstring(&mut env, &headers_json)?,
-            preferred_port,
-        )
-    });
-    write_jstring(&mut env, output)
+    // A panic anywhere below must not abort the host process — catch it and
+    // hand back null, same as any other "couldn't compute a result" outcome.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let output = read_jstring(&mut env, &target_url).and_then(|target_url| {
+            start_local_stream_server(
+                &target_url,
+                &read_jstring(&mut env, &headers_json)?,
+                preferred_port,
+            )
+        });
+        write_jstring(&mut env, output)
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
@@ -49,15 +54,18 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     dv_config_json: JString<'_>,
     preferred_port: JInt,
 ) -> JStringReturn {
-    let output = read_jstring(&mut env, &target_url).and_then(|target_url| {
-        start_dv_rewrite_local_stream_server(
-            &target_url,
-            &read_jstring(&mut env, &headers_json).unwrap_or_default(),
-            &read_jstring(&mut env, &dv_config_json).unwrap_or_default(),
-            preferred_port,
-        )
-    });
-    write_jstring(&mut env, output)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let output = read_jstring(&mut env, &target_url).and_then(|target_url| {
+            start_dv_rewrite_local_stream_server(
+                &target_url,
+                &read_jstring(&mut env, &headers_json).unwrap_or_default(),
+                &read_jstring(&mut env, &dv_config_json).unwrap_or_default(),
+                preferred_port,
+            )
+        });
+        write_jstring(&mut env, output)
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
@@ -66,10 +74,13 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     _class: JObject<'_>,
     server_id: JString<'_>,
 ) -> JBoolean {
-    let result = read_jstring(&mut env, &server_id)
-        .map(|server_id| stop_local_stream_server(&server_id))
-        .unwrap_or(false);
-    if result { 1 } else { 0 }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = read_jstring(&mut env, &server_id)
+            .map(|server_id| stop_local_stream_server(&server_id))
+            .unwrap_or(false);
+        if result { 1 } else { 0 }
+    }))
+    .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -79,9 +90,12 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     cache_dir: JString<'_>,
     preferred_port: JInt,
 ) -> JStringReturn {
-    let output = read_jstring(&mut env, &cache_dir)
-        .and_then(|cache_dir| torrent_engine::start_torrent_server(&cache_dir, preferred_port));
-    write_jstring(&mut env, output)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let output = read_jstring(&mut env, &cache_dir)
+            .and_then(|cache_dir| torrent_engine::start_torrent_server(&cache_dir, preferred_port));
+        write_jstring(&mut env, output)
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
@@ -89,7 +103,10 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     _env: JNIEnv<'_>,
     _class: JObject<'_>,
 ) -> JBoolean {
-    if torrent_engine::stop_torrent_server() { 1 } else { 0 }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if torrent_engine::stop_torrent_server() { 1 } else { 0 }
+    }))
+    .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -97,7 +114,10 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     _env: JNIEnv<'_>,
     _class: JObject<'_>,
 ) -> JBoolean {
-    if dv_rpu_self_test() { 1 } else { 0 }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if dv_rpu_self_test() { 1 } else { 0 }
+    }))
+    .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -105,7 +125,10 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     _env: JNIEnv<'_>,
     _class: JObject<'_>,
 ) -> JBoolean {
-    if dv_auto_detect_was_iptpqc2() { 1 } else { 0 }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if dv_auto_detect_was_iptpqc2() { 1 } else { 0 }
+    }))
+    .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -117,37 +140,40 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     zero_level5: JBoolean,
     remove_hdr10plus: JBoolean,
 ) -> jbyteArray {
-    let empty = env.new_byte_array(0).ok()
-        .map(|a| a.into_raw())
-        .unwrap_or(ptr::null_mut());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let empty = env.new_byte_array(0).ok()
+            .map(|a| a.into_raw())
+            .unwrap_or(ptr::null_mut());
 
-    let len = match env.get_array_length(&data) {
-        Ok(l) => l as usize,
-        Err(_) => return empty,
-    };
+        let len = match env.get_array_length(&data) {
+            Ok(l) => l as usize,
+            Err(_) => return empty,
+        };
 
-    let mut buf_i8: Vec<i8> = vec![0i8; len];
-    if len > 0 && env.get_byte_array_region(&data, 0, &mut buf_i8).is_err() {
-        return empty;
-    }
-    let input: Vec<u8> = buf_i8.into_iter().map(|b| b as u8).collect();
+        let mut buf_i8: Vec<i8> = vec![0i8; len];
+        if len > 0 && env.get_byte_array_region(&data, 0, &mut buf_i8).is_err() {
+            return empty;
+        }
+        let input: Vec<u8> = buf_i8.into_iter().map(|b| b as u8).collect();
 
-    let output = dv_rewrite_segment_bytes(
-        &input,
-        rpu_mode as u8,
-        zero_level5 != 0,
-        remove_hdr10plus != 0,
-    );
+        let output = dv_rewrite_segment_bytes(
+            &input,
+            rpu_mode as u8,
+            zero_level5 != 0,
+            remove_hdr10plus != 0,
+        );
 
-    let result = match env.new_byte_array(output.len() as i32) {
-        Ok(a) => a,
-        Err(_) => return empty,
-    };
-    let output_i8: Vec<i8> = output.iter().map(|&b| b as i8).collect();
-    if env.set_byte_array_region(&result, 0, &output_i8).is_err() {
-        return empty;
-    }
-    result.into_raw()
+        let result = match env.new_byte_array(output.len() as i32) {
+            Ok(a) => a,
+            Err(_) => return empty,
+        };
+        let output_i8: Vec<i8> = output.iter().map(|&b| b as i8).collect();
+        if env.set_byte_array_region(&result, 0, &output_i8).is_err() {
+            return empty;
+        }
+        result.into_raw()
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
@@ -155,5 +181,8 @@ pub unsafe extern "system" fn Java_com_fluxa_app_core_rust_FluxaStreamingNative_
     mut env: JNIEnv<'_>,
     _class: JObject<'_>,
 ) -> JStringReturn {
-    write_jstring(&mut env, Some(dv_get_stream_stats_json()))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_jstring(&mut env, Some(dv_get_stream_stats_json()))
+    }))
+    .unwrap_or(ptr::null_mut())
 }

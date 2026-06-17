@@ -1,3 +1,4 @@
+use crate::constants::DEFAULT_LANGUAGE;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -132,7 +133,7 @@ fn profile_safe_prefs(profile: &Value) -> ProfileSafePrefs {
     .to_string();
 
     ProfileSafePrefs {
-        language: text(profile, "language").unwrap_or("en").to_string(),
+        language: text(profile, "language").unwrap_or(DEFAULT_LANGUAGE).to_string(),
         subtitle_size_percent,
         subtitle_size: 20.0 * (subtitle_size_percent / 100.0),
         subtitle_color: int(profile, "subtitleColor").unwrap_or(0xFFFF_FFFFu32 as i32 as i64),

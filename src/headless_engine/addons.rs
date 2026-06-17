@@ -1,23 +1,72 @@
-use super::helpers::{current_generation, normalize_error, upsert_by_key};
+use super::helpers::{normalize_error, upsert_by_key};
+use super::home;
+use super::state::GenerationKey;
 use super::{EffectResultInput, HeadlessEngine};
 use crate::runtime::{EffectEnvelope, EffectKind};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(super) struct AddonsState {
+    installed: Value,
+    installing: Value,
+    last_resource_request: Value,
+    last_resource_result: Value,
+    error: Value,
+}
+
+impl Default for AddonsState {
+    fn default() -> Self {
+        Self {
+            installed: serde_json::json!([]),
+            installing: Value::Null,
+            last_resource_request: Value::Null,
+            last_resource_result: Value::Null,
+            error: Value::Null,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchAddonManifestPayload {
+    transport_url: String,
+    force_refresh: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshInstalledAddonsPayload {
+    profile: Value,
+    force_refresh: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchAddonResourcePayload {
+    transport_url: String,
+    resource: String,
+    content_type: String,
+    id: String,
+    extra: Value,
+}
 
 pub(super) fn dispatch_install(
     engine: &mut HeadlessEngine,
     transport_url: String,
     force_refresh: Option<bool>,
 ) -> Vec<EffectEnvelope> {
-    let generation = engine.bump_generation("addonGeneration");
-    engine.state["addons"]["installing"] = json!(transport_url.clone());
-    engine.state["addons"]["error"] = Value::Null;
+    let generation = engine.bump_generation(GenerationKey::Addon);
+    engine.state.addons.installing = Value::String(transport_url.clone());
+    engine.state.addons.error = Value::Null;
     vec![engine.effect(
         EffectKind::FetchAddonManifest,
         generation,
-        json!({
-            "transportUrl": transport_url,
-            "forceRefresh": force_refresh.unwrap_or(false)
-        }),
+        FetchAddonManifestPayload {
+            transport_url,
+            force_refresh: force_refresh.unwrap_or(false),
+        },
     )]
 }
 
@@ -26,15 +75,15 @@ pub(super) fn dispatch_refresh(
     profile: Option<Value>,
     force_refresh: Option<bool>,
 ) -> Vec<EffectEnvelope> {
-    let generation = engine.bump_generation("addonGeneration");
-    let profile_value = profile.unwrap_or_else(|| engine.state["profile"]["active"].clone());
+    let generation = engine.bump_generation(GenerationKey::Addon);
+    let profile_value = profile.unwrap_or_else(|| engine.state.profile.active.clone());
     vec![engine.effect(
         EffectKind::RefreshInstalledAddons,
         generation,
-        json!({
-            "profile": profile_value,
-            "forceRefresh": force_refresh.unwrap_or(true)
-        }),
+        RefreshInstalledAddonsPayload {
+            profile: profile_value,
+            force_refresh: force_refresh.unwrap_or(true),
+        },
     )]
 }
 
@@ -46,19 +95,16 @@ pub(super) fn dispatch_resource(
     id: String,
     extra: Option<Value>,
 ) -> Vec<EffectEnvelope> {
-    let generation = engine.bump_generation("addonGeneration");
-    engine.state["addons"]["lastResourceRequest"] = json!({
-        "transportUrl": transport_url,
-        "resource": resource,
-        "contentType": content_type,
-        "id": id,
-        "extra": extra.unwrap_or(Value::Null)
-    });
-    vec![engine.effect(
-        EffectKind::FetchAddonResource,
-        generation,
-        engine.state["addons"]["lastResourceRequest"].clone(),
-    )]
+    let generation = engine.bump_generation(GenerationKey::Addon);
+    let payload = FetchAddonResourcePayload {
+        transport_url,
+        resource,
+        content_type,
+        id,
+        extra: extra.unwrap_or(Value::Null),
+    };
+    engine.state.addons.last_resource_request = serde_json::to_value(&payload).unwrap_or(Value::Null);
+    vec![engine.effect(EffectKind::FetchAddonResource, generation, payload)]
 }
 
 pub(super) fn complete(
@@ -69,7 +115,7 @@ pub(super) fn complete(
 ) -> Vec<EffectEnvelope> {
     match effect_type {
         "fetchAddonManifest" => {
-            if generation == current_generation(&engine.state, "addonGeneration") {
+            if generation == engine.state.runtime.get(GenerationKey::Addon) {
                 if result.status == "ok" {
                     let manifest = result.value.clone();
                     let id = manifest["transportUrl"]
@@ -77,39 +123,39 @@ pub(super) fn complete(
                         .or_else(|| manifest["id"].as_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    upsert_by_key(&mut engine.state["addons"]["installed"], "id", &id, manifest);
-                    engine.state["addons"]["installing"] = Value::Null;
-                    engine.state["addons"]["error"] = Value::Null;
+                    upsert_by_key(&mut engine.state.addons.installed, "id", &id, manifest);
+                    engine.state.addons.installing = Value::Null;
+                    engine.state.addons.error = Value::Null;
                 } else {
-                    engine.state["addons"]["installing"] = Value::Null;
-                    engine.state["addons"]["error"] = normalize_error(result.error.clone());
+                    engine.state.addons.installing = Value::Null;
+                    engine.state.addons.error = normalize_error(result.error.clone());
                 }
             }
         }
         "refreshInstalledAddons" => {
-            if generation == current_generation(&engine.state, "addonGeneration") {
+            if generation == engine.state.runtime.get(GenerationKey::Addon) {
                 if result.status == "ok" {
-                    engine.state["home"]["userAddons"] = result
+                    let addons = result
                         .value
                         .get("addons")
                         .cloned()
                         .unwrap_or_else(|| result.value.clone());
-                    engine.state["addons"]["installed"] =
-                        engine.state["home"]["userAddons"].clone();
-                    engine.state["addons"]["error"] = Value::Null;
+                    home::set_user_addons(engine, addons.clone());
+                    engine.state.addons.installed = addons;
+                    engine.state.addons.error = Value::Null;
                 } else {
-                    engine.state["addons"]["error"] = normalize_error(result.error.clone());
+                    engine.state.addons.error = normalize_error(result.error.clone());
                 }
             }
         }
         "fetchAddonResource" => {
-            if generation == current_generation(&engine.state, "addonGeneration") {
+            if generation == engine.state.runtime.get(GenerationKey::Addon) {
                 if result.status == "ok" {
-                    engine.state["addons"]["lastResourceResult"] = result.value.clone();
-                    engine.state["addons"]["error"] = Value::Null;
+                    engine.state.addons.last_resource_result = result.value.clone();
+                    engine.state.addons.error = Value::Null;
                 } else {
-                    engine.state["addons"]["lastResourceResult"] = Value::Null;
-                    engine.state["addons"]["error"] = normalize_error(result.error.clone());
+                    engine.state.addons.last_resource_result = Value::Null;
+                    engine.state.addons.error = normalize_error(result.error.clone());
                 }
             }
         }

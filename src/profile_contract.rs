@@ -1,3 +1,4 @@
+use crate::constants::{DEFAULT_LANGUAGE, GUEST_PROFILE_ID};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -55,14 +56,14 @@ pub(crate) fn active_profile_plan_json(request_json: &str) -> Option<String> {
     let request = serde_json::from_str::<ActiveProfileRequest>(request_json).ok()?;
     if request.profiles.is_empty() {
         return serde_json::to_string(&json!({
-            "activeId": "guest",
+            "activeId": GUEST_PROFILE_ID,
             "shouldCreateDefault": true,
             "activeProfile": Value::Null
         }))
         .ok();
     }
     let stored = request.stored_active_id.as_deref().unwrap_or("").trim();
-    let active = if stored.is_empty() || stored == "guest" {
+    let active = if stored.is_empty() || stored == GUEST_PROFILE_ID {
         request
             .profiles
             .first()
@@ -80,7 +81,7 @@ pub(crate) fn active_profile_plan_json(request_json: &str) -> Option<String> {
     let active_id = active
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("guest")
+        .unwrap_or(GUEST_PROFILE_ID)
         .to_string();
     serde_json::to_string(&json!({
         "activeId": active_id,
@@ -164,14 +165,14 @@ pub(crate) fn profile_default_seed_json(request_json: &str) -> Option<String> {
     let id = request
         .id
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "guest".to_string());
+        .unwrap_or_else(|| GUEST_PROFILE_ID.to_string());
     let email = request.email.unwrap_or_default();
     let auth_key = request.auth_key.unwrap_or_default();
     let language = request
         .language
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "en".to_string());
-    let is_guest = id == "guest" || auth_key.is_empty();
+        .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+    let is_guest = id == GUEST_PROFILE_ID || auth_key.is_empty();
     serde_json::to_string(&json!({
         "id": id,
         "email": email,
